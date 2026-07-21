@@ -1,7 +1,7 @@
 # 01 项目骨架
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 
 ## 学习目标
 
