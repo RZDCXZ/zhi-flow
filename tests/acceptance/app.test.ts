@@ -45,6 +45,8 @@ describe("Zhi Flow Web 服务", () => {
       ZHI_FLOW_CHAT_API_KEY: secret,
       ZHI_FLOW_CHAT_BASE_URL: "",
       ZHI_FLOW_CHAT_MODEL: "acceptance-test-model",
+      ZHI_FLOW_SUPABASE_URL: "http://127.0.0.1:54321",
+      ZHI_FLOW_SUPABASE_SECRET_KEY: "sb_secret_acceptance-test",
     })
     const result = await waitForExit(application)
 
@@ -90,6 +92,8 @@ function startDevelopmentServer(port: number): ChildProcess {
     ZHI_FLOW_CHAT_API_KEY: "acceptance-test-secret",
     ZHI_FLOW_CHAT_BASE_URL: "https://example.test/v1",
     ZHI_FLOW_CHAT_MODEL: "acceptance-test-model",
+    ZHI_FLOW_SUPABASE_URL: "http://127.0.0.1:54321",
+    ZHI_FLOW_SUPABASE_SECRET_KEY: "sb_secret_acceptance-test",
   })
 }
 

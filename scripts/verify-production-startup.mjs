@@ -21,6 +21,8 @@ const application = spawn(
       ZHI_FLOW_CHAT_API_KEY: secret,
       ZHI_FLOW_CHAT_BASE_URL: "",
       ZHI_FLOW_CHAT_MODEL: "production-startup-test-model",
+      ZHI_FLOW_SUPABASE_URL: "http://127.0.0.1:54321",
+      ZHI_FLOW_SUPABASE_SECRET_KEY: "sb_secret_production-startup-test",
     },
     stdio: "pipe",
   },

@@ -1,7 +1,7 @@
 # 02 数据库基础模型
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 01
 
 ## 学习目标

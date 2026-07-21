@@ -2,6 +2,8 @@ const requiredVariables = [
   "ZHI_FLOW_CHAT_API_KEY",
   "ZHI_FLOW_CHAT_BASE_URL",
   "ZHI_FLOW_CHAT_MODEL",
+  "ZHI_FLOW_SUPABASE_URL",
+  "ZHI_FLOW_SUPABASE_SECRET_KEY",
 ] as const
 
 type RequiredVariable = (typeof requiredVariables)[number]
@@ -11,6 +13,10 @@ export type ServerConfig = Readonly<{
     apiKey: string
     baseUrl: string
     model: string
+  }>
+  supabase: Readonly<{
+    url: string
+    secretKey: string
   }>
 }>
 
@@ -35,12 +41,18 @@ export function loadServerConfig(
 
   const baseUrl = values.get("ZHI_FLOW_CHAT_BASE_URL")!
   assertHttpUrl("ZHI_FLOW_CHAT_BASE_URL", baseUrl)
+  const supabaseUrl = values.get("ZHI_FLOW_SUPABASE_URL")!
+  assertHttpUrl("ZHI_FLOW_SUPABASE_URL", supabaseUrl)
 
   return Object.freeze({
     chat: Object.freeze({
       apiKey: values.get("ZHI_FLOW_CHAT_API_KEY")!,
       baseUrl,
       model: values.get("ZHI_FLOW_CHAT_MODEL")!,
+    }),
+    supabase: Object.freeze({
+      url: supabaseUrl,
+      secretKey: values.get("ZHI_FLOW_SUPABASE_SECRET_KEY")!,
     }),
   })
 }

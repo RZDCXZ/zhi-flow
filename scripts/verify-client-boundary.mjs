@@ -16,6 +16,8 @@ const forbiddenValues = [
   ["ZHI_FLOW_CHAT_API_KEY", process.env.ZHI_FLOW_CHAT_API_KEY],
   ["ZHI_FLOW_CHAT_BASE_URL", process.env.ZHI_FLOW_CHAT_BASE_URL],
   ["ZHI_FLOW_CHAT_MODEL", process.env.ZHI_FLOW_CHAT_MODEL],
+  ["ZHI_FLOW_SUPABASE_URL", process.env.ZHI_FLOW_SUPABASE_URL],
+  ["ZHI_FLOW_SUPABASE_SECRET_KEY", process.env.ZHI_FLOW_SUPABASE_SECRET_KEY],
 ]
 
 for (const [name, value] of forbiddenValues) {
