@@ -13,6 +13,7 @@ export function isChatTokenCount(value: unknown): value is number {
 export type ChatErrorCode =
   | "INVALID_INPUT"
   | "INPUT_TOO_LONG"
+  | "IDEMPOTENCY_REPLAY"
   | "PROVIDER_AUTHENTICATION_FAILED"
   | "RATE_LIMITED"
   | "PROVIDER_UNAVAILABLE"
@@ -38,7 +39,12 @@ type ChatStreamEventBase = Readonly<{
 }>
 
 export type ChatStreamEvent =
-  | (ChatStreamEventBase & Readonly<{ type: "message.created" }>)
+  | (ChatStreamEventBase &
+      Readonly<{
+        type: "message.created"
+        userMessageId: string
+        assistantMessageId: string
+      }>)
   | (ChatStreamEventBase & Readonly<{ type: "content.delta"; delta: string }>)
   | (ChatStreamEventBase &
       Readonly<{ type: "usage.snapshot"; usage: ChatTokenUsage }>)

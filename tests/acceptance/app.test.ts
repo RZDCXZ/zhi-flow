@@ -8,10 +8,14 @@ import {
 } from "node:http"
 import { createServer } from "node:net"
 
+import { createClient } from "@supabase/supabase-js"
 import { afterEach, describe, expect, it } from "vitest"
 
 const runningProcesses = new Set<ChildProcess>()
 const testArtifactDirectories = new Set<string>()
+let currentTestConversationId: string | null = null
+const localSupabaseServiceRoleKey =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU"
 
 afterEach(async () => {
   await Promise.all([...runningProcesses].map(stopProcess))
@@ -35,7 +39,8 @@ describe("Zhi Flow Web 服务", () => {
       expect(html).toContain("观察回答逐步生成")
       expect(html).toContain("输入消息")
       expect(html).toContain("发送消息")
-      expect(html).toContain("答案")
+      expect(html).toContain("新建会话")
+      expect(html).toContain("选择一个 Conversation")
     })
   })
 
@@ -47,6 +52,424 @@ describe("Zhi Flow Web 服务", () => {
       expect(await response.json()).toEqual({
         status: "ok",
         service: "zhi-flow",
+      })
+    })
+  })
+
+  it("通过公开 HTTP 接缝创建、列表、读取、重命名和删除 Conversation", async () => {
+    await withDevelopmentServer(async (baseUrl) => {
+      const createResponse = await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "持久化验收会话" }),
+      })
+      const created = (await createResponse.json()) as {
+        conversation: { id: string; title: string; mode: string }
+      }
+
+      expect(createResponse.status).toBe(201)
+      expect(created.conversation).toMatchObject({
+        id: expect.any(String),
+        title: "持久化验收会话",
+        mode: "general",
+      })
+
+      const listResponse = await fetch(`${baseUrl}/api/conversations`)
+      const listed = (await listResponse.json()) as {
+        conversations: Array<{ id: string; title: string }>
+      }
+      expect(listResponse.status).toBe(200)
+      expect(listed.conversations).toContainEqual(
+        expect.objectContaining({
+          id: created.conversation.id,
+          title: "持久化验收会话",
+        }),
+      )
+
+      const readResponse = await fetch(
+        `${baseUrl}/api/conversations/${created.conversation.id}`,
+      )
+      expect(readResponse.status).toBe(200)
+      await expect(readResponse.json()).resolves.toMatchObject({
+        conversation: { id: created.conversation.id },
+        messages: [],
+      })
+
+      const renameResponse = await fetch(
+        `${baseUrl}/api/conversations/${created.conversation.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: "已重命名会话" }),
+        },
+      )
+      expect(renameResponse.status).toBe(200)
+      await expect(renameResponse.json()).resolves.toMatchObject({
+        conversation: {
+          id: created.conversation.id,
+          title: "已重命名会话",
+        },
+      })
+
+      const deleteResponse = await fetch(
+        `${baseUrl}/api/conversations/${created.conversation.id}`,
+        { method: "DELETE" },
+      )
+      expect(deleteResponse.status).toBe(204)
+      expect(
+        await fetch(`${baseUrl}/api/conversations/${created.conversation.id}`),
+      ).toMatchObject({ status: 404 })
+    })
+  })
+
+  it("在 SSE 开始前持久化 Message，完成后可刷新读取且重复幂等键不重复生成", async () => {
+    let upstreamRequests = 0
+
+    await withChatUpstream(
+      (_request, response) => {
+        upstreamRequests += 1
+        response.setHeader("Content-Type", "text/event-stream")
+        response.end(
+          'data: {"choices":[{"delta":{"content":"持久化回答"}}]}\n\n' +
+            'data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}\n\n' +
+            "data: [DONE]\n\n",
+        )
+      },
+      async (upstreamUrl) => {
+        await withDevelopmentServer(
+          async (baseUrl) => {
+            const createResponse = await fetch(`${baseUrl}/api/conversations`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ title: "Message 持久化验收" }),
+            })
+            const created = (await createResponse.json()) as {
+              conversation: { id: string }
+            }
+            const conversationId = created.conversation.id
+            const clientIdempotencyKey = "33333333-3333-4333-8333-333333333333"
+
+            const response = await fetch(`${baseUrl}/api/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                conversationId,
+                clientIdempotencyKey,
+                requestId: clientIdempotencyKey,
+                message: "请持久化这条消息。",
+              }),
+            })
+            const events = readSseEvents(await response.text())
+
+            expect(response.status).toBe(200)
+            expect(events[0]?.data).toMatchObject({
+              type: "message.created",
+              userMessageId: expect.any(String),
+              assistantMessageId: expect.any(String),
+            })
+
+            const readResponse = await fetch(
+              `${baseUrl}/api/conversations/${conversationId}`,
+            )
+            const history = (await readResponse.json()) as {
+              messages: Array<Record<string, unknown>>
+            }
+            expect(history.messages).toEqual([
+              expect.objectContaining({
+                role: "user",
+                content: "请持久化这条消息。",
+                status: "completed",
+              }),
+              expect.objectContaining({
+                role: "assistant",
+                content: "持久化回答",
+                status: "completed",
+                sourceMessageId: events[0]?.data.userMessageId,
+                errorCode: null,
+              }),
+            ])
+
+            const duplicateResponse = await fetch(`${baseUrl}/api/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                conversationId,
+                clientIdempotencyKey,
+                requestId: "44444444-4444-4444-8444-444444444444",
+                message: "请持久化这条消息。",
+              }),
+            })
+            expect(duplicateResponse.status).toBe(409)
+            await expect(duplicateResponse.json()).resolves.toMatchObject({
+              error: { code: "IDEMPOTENCY_REPLAY" },
+            })
+            expect(upstreamRequests).toBe(1)
+
+            const refreshed = (await (
+              await fetch(`${baseUrl}/api/conversations/${conversationId}`)
+            ).json()) as { messages: Array<{ role: string }> }
+            expect(
+              refreshed.messages.filter(({ role }) => role === "user"),
+            ).toHaveLength(1)
+            expect(refreshed.messages).toHaveLength(2)
+
+            await fetch(`${baseUrl}/api/conversations/${conversationId}`, {
+              method: "DELETE",
+            })
+          },
+          { ZHI_FLOW_CHAT_BASE_URL: `${upstreamUrl}/v1` },
+        )
+      },
+    )
+  })
+
+  it("流中断后保留已生成正文并持久化 failed 终态", async () => {
+    await withChatUpstream(
+      (_request, response) => {
+        response.setHeader("Content-Type", "text/event-stream")
+        response.end(
+          'data: {"choices":[{"delta":{"content":"中断前已保存"}}]}\n\n',
+        )
+      },
+      async (upstreamUrl) => {
+        await withDevelopmentServer(
+          async (baseUrl) => {
+            const created = (await (
+              await fetch(`${baseUrl}/api/conversations`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ title: "失败终态验收" }),
+              })
+            ).json()) as { conversation: { id: string } }
+
+            const response = await fetch(`${baseUrl}/api/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                conversationId: created.conversation.id,
+                clientIdempotencyKey: "55555555-5555-4555-8555-555555555555",
+                message: "测试持久化失败终态。",
+              }),
+            })
+            const events = readSseEvents(await response.text())
+            expect(events.map(({ event }) => event)).toEqual([
+              "message.created",
+              "content.delta",
+              "message.failed",
+            ])
+
+            const history = (await (
+              await fetch(
+                `${baseUrl}/api/conversations/${created.conversation.id}`,
+              )
+            ).json()) as { messages: Array<Record<string, unknown>> }
+            expect(history.messages[1]).toMatchObject({
+              role: "assistant",
+              content: "中断前已保存",
+              status: "failed",
+              errorCode: "STREAM_INTERRUPTED",
+            })
+
+            await fetch(
+              `${baseUrl}/api/conversations/${created.conversation.id}`,
+              { method: "DELETE" },
+            )
+          },
+          { ZHI_FLOW_CHAT_BASE_URL: `${upstreamUrl}/v1` },
+        )
+      },
+    )
+  })
+
+  it("按助手 Message 停止生成并持久化 cancelled 终态", async () => {
+    let resolveProviderCancellation: (() => void) | undefined
+    const providerCancelled = new Promise<void>((resolve) => {
+      resolveProviderCancellation = resolve
+    })
+
+    await withChatUpstream(
+      (_request, response) => {
+        response.setHeader("Content-Type", "text/event-stream")
+        response.write(
+          'data: {"choices":[{"delta":{"content":"停止前已保存"}}]}\n\n',
+        )
+        response.once("close", () => resolveProviderCancellation?.())
+      },
+      async (upstreamUrl) => {
+        await withDevelopmentServer(
+          async (baseUrl) => {
+            const created = (await (
+              await fetch(`${baseUrl}/api/conversations`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ title: "取消终态验收" }),
+              })
+            ).json()) as { conversation: { id: string } }
+            const response = await fetch(`${baseUrl}/api/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                conversationId: created.conversation.id,
+                clientIdempotencyKey: "66666666-6666-4666-8666-666666666666",
+                message: "测试持久化取消终态。",
+              }),
+            })
+            if (response.body === null) throw new Error("聊天响应没有正文流")
+            const reader = response.body.getReader()
+            const firstPart = await readStreamUntil(reader, "停止前已保存")
+            const assistantMessageId =
+              readSseEvents(firstPart)[0]?.data.assistantMessageId
+            expect(assistantMessageId).toEqual(expect.any(String))
+
+            const stopResponse = await withBareDevelopmentServer(
+              (cancellationBaseUrl) =>
+                fetch(`${cancellationBaseUrl}/api/chat`, {
+                  method: "DELETE",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ assistantMessageId }),
+                }),
+              { ZHI_FLOW_CHAT_BASE_URL: `${upstreamUrl}/v1` },
+            )
+            const events = readSseEvents(
+              firstPart + (await readRemainingStream(reader)),
+            )
+            expect(stopResponse.status).toBe(202)
+            expect(events.at(-1)?.event).toBe("message.cancelled")
+            await expect(providerCancelled).resolves.toBeUndefined()
+
+            const history = (await (
+              await fetch(
+                `${baseUrl}/api/conversations/${created.conversation.id}`,
+              )
+            ).json()) as { messages: Array<Record<string, unknown>> }
+            expect(history.messages[1]).toMatchObject({
+              id: assistantMessageId,
+              content: "停止前已保存",
+              status: "cancelled",
+              errorCode: null,
+            })
+
+            await fetch(
+              `${baseUrl}/api/conversations/${created.conversation.id}`,
+              { method: "DELETE" },
+            )
+          },
+          { ZHI_FLOW_CHAT_BASE_URL: `${upstreamUrl}/v1` },
+        )
+      },
+    )
+  })
+
+  it("当前实例没有内存任务时仍按助手 Message 持久化取消", async () => {
+    await withDevelopmentServer(async (baseUrl) => {
+      if (currentTestConversationId === null) {
+        throw new Error("验收 Conversation 尚未创建")
+      }
+      const dataClient = createClient(
+        "http://127.0.0.1:54321",
+        localSupabaseServiceRoleKey,
+        { auth: { autoRefreshToken: false, persistSession: false } },
+      )
+      const { data: userMessage, error: userError } = await dataClient
+        .from("messages")
+        .insert({
+          conversation_id: currentTestConversationId,
+          role: "user",
+          content: "跨实例取消问题",
+          status: "completed",
+          client_idempotency_key: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        })
+        .select("id")
+        .single()
+      if (userError) throw userError
+      const { data: assistantMessage, error: assistantError } = await dataClient
+        .from("messages")
+        .insert({
+          conversation_id: currentTestConversationId,
+          role: "assistant",
+          content: "已持久化的部分正文",
+          status: "streaming",
+          source_message_id: userMessage.id,
+        })
+        .select("id")
+        .single()
+      if (assistantError) throw assistantError
+
+      const response = await fetch(`${baseUrl}/api/chat`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assistantMessageId: assistantMessage.id }),
+      })
+      expect(response.status).toBe(202)
+
+      const history = (await (
+        await fetch(`${baseUrl}/api/conversations/${currentTestConversationId}`)
+      ).json()) as { messages: Array<Record<string, unknown>> }
+      expect(history.messages).toContainEqual(
+        expect.objectContaining({
+          id: assistantMessage.id,
+          content: "已持久化的部分正文",
+          status: "cancelled",
+        }),
+      )
+    })
+  })
+
+  it("刷新读取时将遗留 streaming Message 恢复为可解释的 failed 终态", async () => {
+    await withDevelopmentServer(async (baseUrl) => {
+      const created = (await (
+        await fetch(`${baseUrl}/api/conversations`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: "遗留 streaming 恢复验收" }),
+        })
+      ).json()) as { conversation: { id: string } }
+      const conversationId = created.conversation.id
+      const dataClient = createClient(
+        "http://127.0.0.1:54321",
+        localSupabaseServiceRoleKey,
+        { auth: { autoRefreshToken: false, persistSession: false } },
+      )
+      const { data: userMessage, error: userError } = await dataClient
+        .from("messages")
+        .insert({
+          conversation_id: conversationId,
+          role: "user",
+          content: "刷新前的问题",
+          status: "completed",
+          client_idempotency_key: "77777777-7777-4777-8777-777777777777",
+        })
+        .select("id")
+        .single()
+      if (userError) throw userError
+      const { error: assistantError } = await dataClient
+        .from("messages")
+        .insert({
+          conversation_id: conversationId,
+          role: "assistant",
+          content: "刷新前的部分回答",
+          status: "streaming",
+          source_message_id: userMessage.id,
+          updated_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+        })
+      if (assistantError) throw assistantError
+
+      const response = await fetch(
+        `${baseUrl}/api/conversations/${conversationId}`,
+      )
+      const history = (await response.json()) as {
+        messages: Array<Record<string, unknown>>
+      }
+      expect(response.status).toBe(200)
+      expect(history.messages[1]).toMatchObject({
+        role: "assistant",
+        content: "刷新前的部分回答",
+        status: "failed",
+        errorCode: "STREAM_INTERRUPTED",
+      })
+
+      await fetch(`${baseUrl}/api/conversations/${conversationId}`, {
+        method: "DELETE",
       })
     })
   })
@@ -73,10 +496,12 @@ describe("Zhi Flow Web 服务", () => {
             const response = await fetch(`${baseUrl}/api/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                requestId: "11111111-1111-4111-8111-111111111111",
-                message: "请给我一个简短回答。",
-              }),
+              body: JSON.stringify(
+                chatRequestBody({
+                  requestId: "11111111-1111-4111-8111-111111111111",
+                  message: "请给我一个简短回答。",
+                }),
+              ),
             })
             const body = await response.text()
             const events = readSseEvents(body)
@@ -148,7 +573,9 @@ describe("Zhi Flow Web 服务", () => {
             const response = await fetch(`${baseUrl}/api/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: "测试首字节超时。" }),
+              body: JSON.stringify(
+                chatRequestBody({ message: "测试首字节超时。" }),
+              ),
             })
             const events = readSseEvents(await response.text())
 
@@ -191,7 +618,9 @@ describe("Zhi Flow Web 服务", () => {
             const response = await fetch(`${baseUrl}/api/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: "测试流中断。" }),
+              body: JSON.stringify(
+                chatRequestBody({ message: "测试流中断。" }),
+              ),
             })
             const events = readSseEvents(await response.text())
 
@@ -233,7 +662,9 @@ describe("Zhi Flow Web 服务", () => {
             const response = await fetch(`${baseUrl}/api/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: "测试流空闲超时。" }),
+              body: JSON.stringify(
+                chatRequestBody({ message: "测试流空闲超时。" }),
+              ),
             })
             const events = readSseEvents(await response.text())
 
@@ -273,7 +704,9 @@ describe("Zhi Flow Web 服务", () => {
             const response = await fetch(`${baseUrl}/api/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: "测试聊天总时限。" }),
+              body: JSON.stringify(
+                chatRequestBody({ message: "测试聊天总时限。" }),
+              ),
             })
             const body = await response.text()
             const events = readSseEvents(body)
@@ -320,7 +753,9 @@ describe("Zhi Flow Web 服务", () => {
             const response = await fetch(`${baseUrl}/api/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ requestId, message: "测试停止。" }),
+              body: JSON.stringify(
+                chatRequestBody({ requestId, message: "测试停止。" }),
+              ),
             })
             if (response.body === null) throw new Error("聊天响应没有正文流")
 
@@ -353,7 +788,7 @@ describe("Zhi Flow Web 服务", () => {
       const response = await fetch(`${baseUrl}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: "  \n  " }),
+        body: JSON.stringify(chatRequestBody({ message: "  \n  " })),
       })
 
       expect(response.status).toBe(400)
@@ -372,7 +807,7 @@ describe("Zhi Flow Web 服务", () => {
       const response = await fetch(`${baseUrl}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: "长".repeat(4_001) }),
+        body: JSON.stringify(chatRequestBody({ message: "长".repeat(4_001) })),
       })
 
       expect(response.status).toBe(400)
@@ -556,7 +991,7 @@ async function expectProviderErrorMapping({
         const response = await fetch(`${baseUrl}/api/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message }),
+          body: JSON.stringify(chatRequestBody({ message })),
         })
         const body = await response.text()
         const events = readSseEvents(body)
@@ -589,9 +1024,59 @@ async function withDevelopmentServer(
 
   try {
     await waitUntilReachable(baseUrl)
+    const conversationResponse = await fetch(`${baseUrl}/api/conversations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: `验收会话 ${crypto.randomUUID()}` }),
+    })
+    if (!conversationResponse.ok) throw new Error("无法创建验收 Conversation")
+    const body = (await conversationResponse.json()) as {
+      conversation: { id: string }
+    }
+    currentTestConversationId = body.conversation.id
     await assertions(baseUrl)
   } finally {
+    if (currentTestConversationId !== null) {
+      await fetch(`${baseUrl}/api/conversations/${currentTestConversationId}`, {
+        method: "DELETE",
+      }).catch(() => undefined)
+    }
+    currentTestConversationId = null
     await stopProcess(application)
+  }
+}
+
+async function withBareDevelopmentServer<T>(
+  assertions: (baseUrl: string) => Promise<T>,
+  environmentOverrides: Partial<NodeJS.ProcessEnv> = {},
+): Promise<T> {
+  const port = await findAvailablePort()
+  const application = startDevelopmentServer(port, environmentOverrides)
+  const baseUrl = `http://127.0.0.1:${port}`
+
+  try {
+    await waitUntilReachable(baseUrl)
+    return await assertions(baseUrl)
+  } finally {
+    await stopProcess(application)
+  }
+}
+
+function chatRequestBody({
+  message,
+  requestId,
+}: {
+  message: string
+  requestId?: string
+}) {
+  if (currentTestConversationId === null) {
+    throw new Error("验收 Conversation 尚未创建")
+  }
+  return {
+    conversationId: currentTestConversationId,
+    clientIdempotencyKey: requestId ?? crypto.randomUUID(),
+    ...(requestId ? { requestId } : {}),
+    message,
   }
 }
 
@@ -620,7 +1105,7 @@ function startDevelopmentServer(
     ZHI_FLOW_CHAT_BASE_URL: "https://example.test/v1",
     ZHI_FLOW_CHAT_MODEL: "acceptance-test-model",
     ZHI_FLOW_SUPABASE_URL: "http://127.0.0.1:54321",
-    ZHI_FLOW_SUPABASE_SECRET_KEY: "sb_secret_acceptance-test",
+    ZHI_FLOW_SUPABASE_SECRET_KEY: localSupabaseServiceRoleKey,
     ...environmentOverrides,
   })
 }

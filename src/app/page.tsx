@@ -35,8 +35,8 @@ export default function HomePage() {
             观察回答逐步生成
           </h1>
           <p className="max-w-2xl text-lg leading-relaxed text-muted-foreground sm:text-xl">
-            发送一条消息，观察 SSE
-            正文增量、心跳与终态；生成过程中可以随时停止。
+            创建 Conversation，观察 Message 在 SSE
+            流式生成、取消、失败与刷新后的持久状态。
           </p>
         </div>
 
@@ -44,7 +44,7 @@ export default function HomePage() {
       </main>
 
       <footer className="border-t bg-muted/30 py-7 text-center text-sm text-muted-foreground sm:text-base">
-        里程碑 04 · 流式输出与取消
+        里程碑 05 · Conversation 与 Message 持久化
       </footer>
     </div>
   )

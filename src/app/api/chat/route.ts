@@ -12,6 +12,13 @@ import {
 } from "@/server/chat/chat-provider"
 import { OpenAiCompatibleChatProvider } from "@/server/chat/openai-compatible-chat-provider"
 import { serverConfig } from "@/server/config"
+import {
+  appendAssistantContent,
+  cancelAssistantMessage,
+  createMessageAttempt,
+  finishAssistantMessage,
+  isAssistantMessageStreaming,
+} from "@/server/conversations"
 
 export const dynamic = "force-dynamic"
 
@@ -97,13 +104,40 @@ export async function POST(request: Request) {
     })
   }
 
+  let attempt
+  try {
+    attempt = await createMessageAttempt(
+      body.conversationId,
+      message,
+      body.clientIdempotencyKey,
+    )
+  } catch {
+    return chatError({
+      status: 404,
+      code: "INVALID_INPUT",
+      message: "会话不存在或暂时不可用。",
+      retryable: false,
+    })
+  }
+  if (attempt.duplicate || attempt.assistantMessageId === null) {
+    return chatError({
+      status: 409,
+      code: "IDEMPOTENCY_REPLAY",
+      message: "这条消息已经提交过。",
+      retryable: false,
+    })
+  }
+
   const cancellation = new AbortController()
   activeChats.set(requestId, cancellation)
+  activeChats.set(attempt.assistantMessageId, cancellation)
   const stream = createResponseStream({
     request,
     requestId,
     message,
     cancellation,
+    userMessageId: attempt.userMessageId,
+    assistantMessageId: attempt.assistantMessageId,
     provider: chatProvider,
   })
 
@@ -118,11 +152,24 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const requestId = await readCancellationRequestId(request)
-  if (requestId === null) return chatError(invalidInputError)
+  const target = await readCancellationTarget(request)
+  if (target === null) return chatError(invalidInputError)
 
-  const cancellation = activeChats.get(requestId)
-  if (cancellation === undefined) {
+  const cancellation = activeChats.get(target.id)
+  let persistedCancellation = false
+  if (target.kind === "assistant") {
+    try {
+      persistedCancellation = await cancelAssistantMessage(target.id)
+    } catch {
+      return chatError({
+        status: 503,
+        code: "INTERNAL_ERROR",
+        message: "暂时无法停止本次生成。",
+        retryable: true,
+      })
+    }
+  }
+  if (!persistedCancellation && cancellation === undefined) {
     return chatError({
       status: 404,
       code: "INVALID_INPUT",
@@ -131,7 +178,7 @@ export async function DELETE(request: Request) {
     })
   }
 
-  cancellation.abort()
+  cancellation?.abort()
   return new Response(null, {
     status: 202,
     headers: { "Cache-Control": "no-store" },
@@ -143,6 +190,8 @@ type ResponseStreamOptions = Readonly<{
   requestId: string
   message: string
   cancellation: AbortController
+  userMessageId: string
+  assistantMessageId: string
   provider: ChatProvider
 }>
 
@@ -157,6 +206,8 @@ function createResponseStream({
   requestId,
   message,
   cancellation,
+  userMessageId,
+  assistantMessageId,
   provider,
 }: ResponseStreamOptions): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
@@ -205,8 +256,9 @@ function createResponseStream({
       }
 
       void (async () => {
+        let persistedContent = ""
         try {
-          emit({ type: "message.created" })
+          emit({ type: "message.created", userMessageId, assistantMessageId })
           await pipeProviderStream({
             provider,
             message,
@@ -214,20 +266,43 @@ function createResponseStream({
             disconnected: request.signal,
             totalTimeout: totalTimeout.signal,
             emit,
+            onContent: async (content) => {
+              persistedContent = content
+              return appendAssistantContent(assistantMessageId, content)
+            },
+            onTerminal: async (status, errorCode) => {
+              return finishAssistantMessage(
+                assistantMessageId,
+                status,
+                persistedContent,
+                errorCode,
+              )
+            },
           })
         } catch (error) {
           const failure =
             error instanceof ChatProviderError
               ? providerErrors[error.kind]
               : internalError
-          emit({
-            type: "message.failed",
-            error: withoutStatus(failure),
-          })
+          const failurePersisted = await finishAssistantMessage(
+            assistantMessageId,
+            "failed",
+            persistedContent,
+            failure.code,
+          ).catch(() => null)
+          if (failurePersisted !== false) {
+            emit({
+              type: "message.failed",
+              error: withoutStatus(failure),
+            })
+          } else {
+            emit({ type: "message.cancelled" })
+          }
         } finally {
           clearTimeout(totalTimer)
           clearInterval(heartbeatTimer)
           activeChats.delete(requestId)
+          activeChats.delete(assistantMessageId)
           closed = true
           if (!consumerCancelled) controller.close()
         }
@@ -240,6 +315,8 @@ function createResponseStream({
         disconnected,
         totalTimeout,
         emit,
+        onContent,
+        onTerminal,
       }: Readonly<{
         provider: ChatProvider
         message: string
@@ -247,8 +324,14 @@ function createResponseStream({
         disconnected: AbortSignal
         totalTimeout: AbortSignal
         emit: (event: ChatStreamEventData) => void
+        onContent: (content: string) => Promise<boolean>
+        onTerminal: (
+          status: "completed" | "cancelled",
+          errorCode: string | null,
+        ) => Promise<boolean>
       }>): Promise<void> {
         let contentStarted = false
+        let completeContent = ""
 
         for (
           let attempt = 1;
@@ -277,7 +360,12 @@ function createResponseStream({
                   ? serverConfig.chat.firstByteTimeoutMs
                   : serverConfig.chat.idleTimeoutMs,
                 attemptTimeout,
+                assistantMessageId,
               )
+              if (result === assistantCancelled) {
+                emit({ type: "message.cancelled" })
+                return
+              }
               if (result.done) break
               firstActivity = false
 
@@ -285,6 +373,11 @@ function createResponseStream({
                 if (!result.value.delta) continue
                 receivedContent = true
                 contentStarted = true
+                completeContent += result.value.delta
+                if (!(await onContent(completeContent))) {
+                  emit({ type: "message.cancelled" })
+                  return
+                }
                 emit({ type: "content.delta", delta: result.value.delta })
               } else if (result.value.type === "usage.snapshot") {
                 usage = result.value.usage
@@ -295,6 +388,10 @@ function createResponseStream({
               throw new ChatProviderError("invalid_response")
             }
             emit({ type: "usage.snapshot", usage })
+            if (!(await onTerminal("completed", null))) {
+              emit({ type: "message.cancelled" })
+              return
+            }
             emit({
               type: "message.completed",
               latencyMs: Math.round(performance.now() - startedAt),
@@ -302,6 +399,7 @@ function createResponseStream({
             return
           } catch (error) {
             if (cancellation.aborted || disconnected.aborted) {
+              await onTerminal("cancelled", null)
               emit({ type: "message.cancelled" })
               return
             }
@@ -336,22 +434,34 @@ async function nextWithTimeout<T>(
   iterator: AsyncIterator<T>,
   timeoutMs: number,
   timeoutController: AbortController,
-): Promise<IteratorResult<T>> {
-  let timer: ReturnType<typeof setTimeout> | undefined
+  assistantMessageId: string,
+): Promise<IteratorResult<T> | typeof assistantCancelled> {
+  const deadline = performance.now() + timeoutMs
   const next = iterator.next()
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new ChatProviderError("timeout"))
-      timeoutController.abort()
-    }, timeoutMs)
-  })
 
-  try {
-    return await Promise.race([next, timeout])
-  } finally {
+  while (true) {
+    const remainingMs = deadline - performance.now()
+    if (remainingMs <= 0) {
+      timeoutController.abort()
+      throw new ChatProviderError("timeout")
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const poll = new Promise<null>((resolve) => {
+      timer = setTimeout(resolve, Math.min(500, remainingMs), null)
+    })
+    const result = await Promise.race([next, poll])
     clearTimeout(timer)
+    if (result !== null) return result
+
+    if (!(await isAssistantMessageStreaming(assistantMessageId))) {
+      timeoutController.abort()
+      return assistantCancelled
+    }
   }
 }
+
+const assistantCancelled = Symbol("assistant-cancelled")
 
 function normalizeProviderError(error: unknown): ChatProviderError {
   return error instanceof ChatProviderError
@@ -359,52 +469,65 @@ function normalizeProviderError(error: unknown): ChatProviderError {
     : new ChatProviderError("unavailable")
 }
 
-async function readRequestBody(
-  request: Request,
-): Promise<{ message: string; requestId?: string } | null> {
+async function readRequestBody(request: Request): Promise<{
+  message: string
+  conversationId: string
+  clientIdempotencyKey: string
+  requestId?: string
+} | null> {
   try {
     const body: unknown = await request.json()
     if (
       typeof body !== "object" ||
       body === null ||
       !("message" in body) ||
-      typeof body.message !== "string"
+      typeof body.message !== "string" ||
+      !("conversationId" in body) ||
+      !isNonEmptyBoundedString(body.conversationId) ||
+      !("clientIdempotencyKey" in body) ||
+      !isNonEmptyBoundedString(body.clientIdempotencyKey)
     ) {
       return null
     }
     const requestId =
       "requestId" in body
-        ? isRequestId(body.requestId)
+        ? isNonEmptyBoundedString(body.requestId)
           ? body.requestId
           : null
         : undefined
     if (requestId === null) return null
-    return { message: body.message, ...(requestId ? { requestId } : {}) }
+    return {
+      message: body.message,
+      conversationId: body.conversationId,
+      clientIdempotencyKey: body.clientIdempotencyKey,
+      ...(requestId ? { requestId } : {}),
+    }
   } catch {
     return null
   }
 }
 
-async function readCancellationRequestId(
+async function readCancellationTarget(
   request: Request,
-): Promise<string | null> {
+): Promise<{ kind: "assistant" | "request"; id: string } | null> {
   try {
     const body: unknown = await request.json()
+    if (typeof body !== "object" || body === null) return null
     if (
-      typeof body !== "object" ||
-      body === null ||
-      !("requestId" in body) ||
-      !isRequestId(body.requestId)
+      "assistantMessageId" in body &&
+      isNonEmptyBoundedString(body.assistantMessageId)
     ) {
-      return null
+      return { kind: "assistant", id: body.assistantMessageId }
     }
-    return body.requestId
+    return "requestId" in body && isNonEmptyBoundedString(body.requestId)
+      ? { kind: "request", id: body.requestId }
+      : null
   } catch {
     return null
   }
 }
 
-function isRequestId(value: unknown): value is string {
+function isNonEmptyBoundedString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 128
 }
 

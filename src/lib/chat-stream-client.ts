@@ -98,9 +98,15 @@ function isChatStreamEvent(value: unknown): value is ChatStreamEvent {
   }
 
   switch (value.type) {
-    case "message.created":
     case "message.cancelled":
       return true
+    case "message.created":
+      return (
+        "userMessageId" in value &&
+        typeof value.userMessageId === "string" &&
+        "assistantMessageId" in value &&
+        typeof value.assistantMessageId === "string"
+      )
     case "content.delta":
       return "delta" in value && typeof value.delta === "string"
     case "usage.snapshot":

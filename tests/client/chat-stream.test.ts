@@ -6,7 +6,10 @@ describe("聊天 SSE 客户端", () => {
   it("跨分块增量解码并按 requestId 与单调 sequence 去重", async () => {
     const requestId = "33333333-3333-4333-8333-333333333333"
     const frames = [
-      eventFrame("message.created", requestId, 1),
+      eventFrame("message.created", requestId, 1, {
+        userMessageId: "88888888-8888-4888-8888-888888888888",
+        assistantMessageId: "99999999-9999-4999-8999-999999999999",
+      }),
       eventFrame("content.delta", requestId, 2, { delta: "逐步" }),
       eventFrame("content.delta", requestId, 2, { delta: "逐步" }),
       eventFrame("content.delta", requestId, 3, { delta: "显示" }),
