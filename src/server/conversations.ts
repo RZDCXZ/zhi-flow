@@ -52,18 +52,19 @@ export async function createConversation(title: string): Promise<Conversation> {
   return toConversation(data as ConversationRow)
 }
 
-export async function readGeneralChatHistory(
+export async function readChatContext(
   conversationId: string,
-): Promise<ChatMessage[] | null> {
+): Promise<{ mode: Conversation["mode"]; messages: ChatMessage[] } | null> {
   const client = createServerDataClient()
   const { data: conversation, error: conversationError } = await client
     .from("conversations")
-    .select("id")
+    .select("id,mode")
     .eq("id", conversationId)
-    .eq("mode", "general")
     .maybeSingle()
   if (conversationError) throw conversationError
   if (conversation === null) return null
+  const mode = conversation.mode as Conversation["mode"]
+  if (mode !== "general") return { mode, messages: [] }
 
   const { data: messages, error: messagesError } = await client
     .from("messages")
@@ -75,9 +76,12 @@ export async function readGeneralChatHistory(
     .limit(GENERAL_CHAT_CONTEXT_MESSAGE_LIMIT - 1)
   if (messagesError) throw messagesError
 
-  return (messages as Array<Pick<MessageRow, "role" | "content">>)
-    .reverse()
-    .map(({ role, content }) => ({ role, content }))
+  return {
+    mode,
+    messages: (messages as Array<Pick<MessageRow, "role" | "content">>)
+      .reverse()
+      .map(({ role, content }) => ({ role, content })),
+  }
 }
 
 export async function readConversation(
