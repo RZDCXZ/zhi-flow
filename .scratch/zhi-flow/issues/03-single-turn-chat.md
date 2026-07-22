@@ -1,7 +1,7 @@
 # 03 非流式单轮聊天
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 02
 
 ## 学习目标
@@ -38,3 +38,5 @@ Blocked by: 02
 - 流式输出、持久化、多轮上下文、RAG 和供应商切换 UI。
 
 ## Comments
+
+- 已实现非流式单轮聊天的 Provider 合约、可控假 Provider、OpenAI-compatible 适配器、公开 HTTP API、极简界面、超时与稳定错误分类；里程碑 4 仍等待用户明确决定后再进入。

@@ -12,6 +12,30 @@ const validEnvironment: NodeJS.ProcessEnv = {
 }
 
 describe("服务端配置", () => {
+  it("提供 OpenAI-compatible 聊天配置与可覆盖的超时", () => {
+    const config = loadServerConfig({
+      ...validEnvironment,
+      ZHI_FLOW_CHAT_TIMEOUT_MS: "2500",
+    })
+
+    expect(config.chat).toEqual({
+      apiKey: "test-chat-secret",
+      baseUrl: "https://example.test/v1",
+      model: "test-chat-model",
+      timeoutMs: 2_500,
+    })
+  })
+
+  it("聊天超时未配置时使用安全默认值，并拒绝非正整数", () => {
+    expect(loadServerConfig(validEnvironment).chat.timeoutMs).toBe(15_000)
+    expect(() =>
+      loadServerConfig({
+        ...validEnvironment,
+        ZHI_FLOW_CHAT_TIMEOUT_MS: "0",
+      }),
+    ).toThrowError(/ZHI_FLOW_CHAT_TIMEOUT_MS/)
+  })
+
   it("提供仅供服务端数据访问使用的 Supabase 配置", () => {
     const config = loadServerConfig(validEnvironment)
 

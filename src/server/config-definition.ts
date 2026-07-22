@@ -13,6 +13,7 @@ export type ServerConfig = Readonly<{
     apiKey: string
     baseUrl: string
     model: string
+    timeoutMs: number
   }>
   supabase: Readonly<{
     url: string
@@ -49,12 +50,25 @@ export function loadServerConfig(
       apiKey: values.get("ZHI_FLOW_CHAT_API_KEY")!,
       baseUrl,
       model: values.get("ZHI_FLOW_CHAT_MODEL")!,
+      timeoutMs: loadChatTimeoutMs(environment),
     }),
     supabase: Object.freeze({
       url: supabaseUrl,
       secretKey: values.get("ZHI_FLOW_SUPABASE_SECRET_KEY")!,
     }),
   })
+}
+
+function loadChatTimeoutMs(environment: NodeJS.ProcessEnv): number {
+  const configuredValue = environment.ZHI_FLOW_CHAT_TIMEOUT_MS?.trim()
+  if (!configuredValue) return 15_000
+
+  const timeoutMs = Number(configuredValue)
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("后端配置无效：ZHI_FLOW_CHAT_TIMEOUT_MS 必须是正整数毫秒值")
+  }
+
+  return timeoutMs
 }
 
 function assertHttpUrl(variable: RequiredVariable, value: string): void {
