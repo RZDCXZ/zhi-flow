@@ -14,6 +14,10 @@ import { afterEach, describe, expect, it } from "vitest"
 const runningProcesses = new Set<ChildProcess>()
 const testArtifactDirectories = new Set<string>()
 let currentTestConversationId: string | null = null
+type ProviderMessage = Readonly<{
+  role: "user" | "assistant"
+  content: string
+}>
 const localSupabaseServiceRoleKey =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU"
 
@@ -36,11 +40,13 @@ describe("Zhi Flow Web 服务", () => {
 
       expect(response.status).toBe(200)
       expect(html).toContain("Zhi Flow")
-      expect(html).toContain("观察回答逐步生成")
+      expect(html).toContain("观察多轮上下文增长")
       expect(html).toContain("输入消息")
       expect(html).toContain("发送消息")
       expect(html).toContain("新建会话")
       expect(html).toContain("选择一个 Conversation")
+      expect(html).toContain("最近 12 条已完成 Message")
+      expect(html).toContain("输入 Token")
     })
   })
 
@@ -216,6 +222,229 @@ describe("Zhi Flow Web 服务", () => {
             await fetch(`${baseUrl}/api/conversations/${conversationId}`, {
               method: "DELETE",
             })
+          },
+          { ZHI_FLOW_CHAT_BASE_URL: `${upstreamUrl}/v1` },
+        )
+      },
+    )
+  })
+
+  it("通用聊天按序发送已完成 Message，并隔离其他 Conversation 与无效助手正文", async () => {
+    const providerRequests: ProviderMessage[][] = []
+
+    await withChatUpstream(
+      async (request, response) => {
+        const body = JSON.parse(await readRequestText(request)) as {
+          messages: ProviderMessage[]
+        }
+        providerRequests.push(body.messages)
+        response.setHeader("Content-Type", "text/event-stream")
+        response.end(
+          'data: {"choices":[{"delta":{"content":"续聊成功"}}]}\n\n' +
+            'data: {"choices":[],"usage":{"prompt_tokens":21,"completion_tokens":4,"total_tokens":25}}\n\n' +
+            "data: [DONE]\n\n",
+        )
+      },
+      async (upstreamUrl) => {
+        await withDevelopmentServer(
+          async (baseUrl) => {
+            if (currentTestConversationId === null) {
+              throw new Error("验收 Conversation 尚未创建")
+            }
+            const dataClient = createAcceptanceDataClient()
+
+            async function sendMessage(message: string) {
+              const response = await fetch(`${baseUrl}/api/chat`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(chatRequestBody({ message })),
+              })
+              expect(response.status).toBe(200)
+              expect(readSseEvents(await response.text()).at(-1)?.event).toBe(
+                "message.completed",
+              )
+            }
+
+            await sendMessage("我的代号是星河。")
+            await sendMessage("我的代号是什么？")
+
+            const startedAt = Date.now() + 10_000
+
+            async function insertAttempt(
+              sequence: number,
+              userContent: string,
+              assistantContent: string,
+              assistantStatus:
+                "streaming" | "completed" | "cancelled" | "failed",
+              conversationId = currentTestConversationId,
+            ) {
+              const userCreatedAt = new Date(
+                startedAt + sequence * 2_000,
+              ).toISOString()
+              const { data: userMessage, error: userError } = await dataClient
+                .from("messages")
+                .insert({
+                  conversation_id: conversationId,
+                  role: "user",
+                  content: userContent,
+                  status: "completed",
+                  client_idempotency_key: crypto.randomUUID(),
+                  created_at: userCreatedAt,
+                  updated_at: userCreatedAt,
+                })
+                .select("id")
+                .single()
+              if (userError) throw userError
+
+              const assistantCreatedAt = new Date(
+                startedAt + sequence * 2_000 + 1_000,
+              ).toISOString()
+              const { error: assistantError } = await dataClient
+                .from("messages")
+                .insert({
+                  conversation_id: conversationId,
+                  role: "assistant",
+                  content: assistantContent,
+                  status: assistantStatus,
+                  source_message_id: userMessage.id,
+                  created_at: assistantCreatedAt,
+                  updated_at: assistantCreatedAt,
+                })
+              if (assistantError) throw assistantError
+            }
+
+            await insertAttempt(0, "失败问题", "不应出现的失败正文", "failed")
+            await insertAttempt(
+              1,
+              "取消问题",
+              "不应出现的取消正文",
+              "cancelled",
+            )
+            await insertAttempt(
+              2,
+              "未完成问题",
+              "不应出现的流式正文",
+              "streaming",
+            )
+
+            const isolated = (await (
+              await fetch(`${baseUrl}/api/conversations`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ title: "隔离 Conversation" }),
+              })
+            ).json()) as { conversation: { id: string } }
+            await insertAttempt(
+              3,
+              "另一个 Conversation 的问题",
+              "另一个 Conversation 的回答",
+              "completed",
+              isolated.conversation.id,
+            )
+
+            await sendMessage("失败后继续。")
+            expect(providerRequests).toEqual([
+              [{ role: "user", content: "我的代号是星河。" }],
+              [
+                { role: "user", content: "我的代号是星河。" },
+                { role: "assistant", content: "续聊成功" },
+                { role: "user", content: "我的代号是什么？" },
+              ],
+              [
+                { role: "user", content: "我的代号是星河。" },
+                { role: "assistant", content: "续聊成功" },
+                { role: "user", content: "我的代号是什么？" },
+                { role: "assistant", content: "续聊成功" },
+                { role: "user", content: "失败问题" },
+                { role: "user", content: "取消问题" },
+                { role: "user", content: "未完成问题" },
+                { role: "user", content: "失败后继续。" },
+              ],
+            ])
+
+            await fetch(
+              `${baseUrl}/api/conversations/${isolated.conversation.id}`,
+              { method: "DELETE" },
+            )
+          },
+          { ZHI_FLOW_CHAT_BASE_URL: `${upstreamUrl}/v1` },
+        )
+      },
+    )
+  })
+
+  it("通用聊天只向 Provider 发送最近十二条已完成 Message", async () => {
+    let providerMessages: ProviderMessage[] = []
+
+    await withChatUpstream(
+      async (request, response) => {
+        const body = JSON.parse(await readRequestText(request)) as {
+          messages: typeof providerMessages
+        }
+        providerMessages = body.messages
+        response.setHeader("Content-Type", "text/event-stream")
+        response.end(
+          'data: {"choices":[{"delta":{"content":"已截断上下文"}}]}\n\n' +
+            'data: {"choices":[],"usage":{"prompt_tokens":48,"completion_tokens":5,"total_tokens":53}}\n\n' +
+            "data: [DONE]\n\n",
+        )
+      },
+      async (upstreamUrl) => {
+        await withDevelopmentServer(
+          async (baseUrl) => {
+            if (currentTestConversationId === null) {
+              throw new Error("验收 Conversation 尚未创建")
+            }
+            const dataClient = createAcceptanceDataClient()
+            const createdAt = Date.now() - 60_000
+            const { error } = await dataClient.from("messages").insert(
+              Array.from({ length: 13 }, (_, index) => {
+                const timestamp = new Date(
+                  createdAt + index * 1_000,
+                ).toISOString()
+                return {
+                  conversation_id: currentTestConversationId,
+                  role: "user",
+                  content: `历史 Message ${index + 1}`,
+                  status: "completed",
+                  client_idempotency_key: crypto.randomUUID(),
+                  created_at: timestamp,
+                  updated_at: timestamp,
+                }
+              }),
+            )
+            if (error) throw error
+
+            const response = await fetch(`${baseUrl}/api/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(
+                chatRequestBody({ message: "当前 Message 14" }),
+              ),
+            })
+            const events = readSseEvents(await response.text())
+
+            expect(response.status).toBe(200)
+            expect(providerMessages).toHaveLength(12)
+            expect(providerMessages.map(({ content }) => content)).toEqual([
+              ...Array.from(
+                { length: 11 },
+                (_, index) => `历史 Message ${index + 3}`,
+              ),
+              "当前 Message 14",
+            ])
+            expect(events).toContainEqual(
+              expect.objectContaining({
+                event: "usage.snapshot",
+                data: expect.objectContaining({
+                  usage: {
+                    inputTokens: 48,
+                    outputTokens: 5,
+                    totalTokens: 53,
+                  },
+                }),
+              }),
+            )
           },
           { ZHI_FLOW_CHAT_BASE_URL: `${upstreamUrl}/v1` },
         )
@@ -1137,6 +1366,18 @@ async function withChatUpstream(
       server.close((error) => (error ? reject(error) : resolve()))
     })
   }
+}
+
+async function readRequestText(request: IncomingMessage): Promise<string> {
+  let body = ""
+  for await (const chunk of request) body += String(chunk)
+  return body
+}
+
+function createAcceptanceDataClient() {
+  return createClient("http://127.0.0.1:54321", localSupabaseServiceRoleKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  })
 }
 
 function startNextDevelopmentServer(

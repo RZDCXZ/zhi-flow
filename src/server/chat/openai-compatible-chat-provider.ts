@@ -35,7 +35,7 @@ export class OpenAiCompatibleChatProvider implements ChatProvider {
           },
           body: JSON.stringify({
             model: this.config.model,
-            messages: [{ role: "user", content: request.message }],
+            messages: request.messages,
             stream: true,
             stream_options: { include_usage: true },
           }),

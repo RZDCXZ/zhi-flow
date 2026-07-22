@@ -1,7 +1,7 @@
 # 06 基础多轮对话
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 05
 
 ## 学习目标
@@ -38,3 +38,5 @@ Blocked by: 05
 - 摘要、长期 Token 预算、问题改写和 Knowledge Base。
 
 ## Comments
+
+- 2026-07-22 浏览器冒烟：使用本地假 Provider 完成含代词的两轮对话；输入 Token 从 10 增长到 30，刷新后四条 Message 全部恢复并可继续输入。失败、取消和未完成助手正文的过滤由公开 HTTP/SSE 验收覆盖。

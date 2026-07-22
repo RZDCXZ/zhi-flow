@@ -1,6 +1,8 @@
 import "server-only"
 
 import type { Conversation, Message } from "@/lib/conversation-api"
+import { GENERAL_CHAT_CONTEXT_MESSAGE_LIMIT } from "@/lib/chat-api"
+import type { ChatMessage } from "@/server/chat/chat-provider"
 
 import { serverConfig } from "./config"
 import { createServerDataClient } from "./supabase"
@@ -48,6 +50,34 @@ export async function createConversation(title: string): Promise<Conversation> {
     .single()
   if (error) throw error
   return toConversation(data as ConversationRow)
+}
+
+export async function readGeneralChatHistory(
+  conversationId: string,
+): Promise<ChatMessage[] | null> {
+  const client = createServerDataClient()
+  const { data: conversation, error: conversationError } = await client
+    .from("conversations")
+    .select("id")
+    .eq("id", conversationId)
+    .eq("mode", "general")
+    .maybeSingle()
+  if (conversationError) throw conversationError
+  if (conversation === null) return null
+
+  const { data: messages, error: messagesError } = await client
+    .from("messages")
+    .select("role,content")
+    .eq("conversation_id", conversationId)
+    .eq("status", "completed")
+    .order("created_at", { ascending: false })
+    .order("role", { ascending: false })
+    .limit(GENERAL_CHAT_CONTEXT_MESSAGE_LIMIT - 1)
+  if (messagesError) throw messagesError
+
+  return (messages as Array<Pick<MessageRow, "role" | "content">>)
+    .reverse()
+    .map(({ role, content }) => ({ role, content }))
 }
 
 export async function readConversation(

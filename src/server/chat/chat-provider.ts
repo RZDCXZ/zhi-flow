@@ -1,7 +1,12 @@
 import type { ChatTokenUsage } from "../../lib/chat-api"
 
+export type ChatMessage = Readonly<{
+  role: "user" | "assistant"
+  content: string
+}>
+
 export type ChatRequest = Readonly<{
-  message: string
+  messages: readonly ChatMessage[]
   signal: AbortSignal
 }>
 

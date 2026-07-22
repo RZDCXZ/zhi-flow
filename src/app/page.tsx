@@ -32,11 +32,11 @@ export default function HomePage() {
       <main className="mx-auto flex w-full max-w-7xl flex-col justify-center gap-10 px-5 py-12 sm:px-8 sm:py-16">
         <div className="max-w-3xl space-y-4">
           <h1 className="text-4xl leading-tight font-semibold tracking-[-0.04em] sm:text-6xl">
-            观察回答逐步生成
+            观察多轮上下文增长
           </h1>
           <p className="max-w-2xl text-lg leading-relaxed text-muted-foreground sm:text-xl">
-            创建 Conversation，观察 Message 在 SSE
-            流式生成、取消、失败与刷新后的持久状态。
+            在独立 Conversation 中连续追问，观察发送给 Provider 的角色顺序与
+            Token 用量。
           </p>
         </div>
 
@@ -44,7 +44,7 @@ export default function HomePage() {
       </main>
 
       <footer className="border-t bg-muted/30 py-7 text-center text-sm text-muted-foreground sm:text-base">
-        里程碑 05 · Conversation 与 Message 持久化
+        里程碑 06 · 基础多轮对话
       </footer>
     </div>
   )

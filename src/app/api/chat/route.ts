@@ -9,6 +9,7 @@ import {
   ChatProviderError,
   type ChatProvider,
   type ChatProviderErrorKind,
+  type ChatMessage,
 } from "@/server/chat/chat-provider"
 import { OpenAiCompatibleChatProvider } from "@/server/chat/openai-compatible-chat-provider"
 import { serverConfig } from "@/server/config"
@@ -18,6 +19,7 @@ import {
   createMessageAttempt,
   finishAssistantMessage,
   isAssistantMessageStreaming,
+  readGeneralChatHistory,
 } from "@/server/conversations"
 
 export const dynamic = "force-dynamic"
@@ -104,6 +106,26 @@ export async function POST(request: Request) {
     })
   }
 
+  let history
+  try {
+    history = await readGeneralChatHistory(body.conversationId)
+  } catch {
+    return chatError({
+      status: 503,
+      code: "INTERNAL_ERROR",
+      message: "暂时无法读取会话上下文。",
+      retryable: true,
+    })
+  }
+  if (history === null) {
+    return chatError({
+      status: 404,
+      code: "INVALID_INPUT",
+      message: "通用会话不存在或不可用。",
+      retryable: false,
+    })
+  }
+
   let attempt
   try {
     attempt = await createMessageAttempt(
@@ -134,7 +156,7 @@ export async function POST(request: Request) {
   const stream = createResponseStream({
     request,
     requestId,
-    message,
+    messages: [...history, { role: "user", content: message }],
     cancellation,
     userMessageId: attempt.userMessageId,
     assistantMessageId: attempt.assistantMessageId,
@@ -188,7 +210,7 @@ export async function DELETE(request: Request) {
 type ResponseStreamOptions = Readonly<{
   request: Request
   requestId: string
-  message: string
+  messages: readonly ChatMessage[]
   cancellation: AbortController
   userMessageId: string
   assistantMessageId: string
@@ -204,7 +226,7 @@ type ChatStreamEventData = ChatStreamEvent extends infer Event
 function createResponseStream({
   request,
   requestId,
-  message,
+  messages,
   cancellation,
   userMessageId,
   assistantMessageId,
@@ -261,7 +283,7 @@ function createResponseStream({
           emit({ type: "message.created", userMessageId, assistantMessageId })
           await pipeProviderStream({
             provider,
-            message,
+            messages,
             cancellation: cancellation.signal,
             disconnected: request.signal,
             totalTimeout: totalTimeout.signal,
@@ -310,7 +332,7 @@ function createResponseStream({
 
       async function pipeProviderStream({
         provider,
-        message,
+        messages,
         cancellation,
         disconnected,
         totalTimeout,
@@ -319,7 +341,7 @@ function createResponseStream({
         onTerminal,
       }: Readonly<{
         provider: ChatProvider
-        message: string
+        messages: readonly ChatMessage[]
         cancellation: AbortSignal
         disconnected: AbortSignal
         totalTimeout: AbortSignal
@@ -349,7 +371,7 @@ function createResponseStream({
           let receivedContent = false
           let firstActivity = true
           const iterator = provider
-            .stream({ message, signal })
+            .stream({ messages, signal })
             [Symbol.asyncIterator]()
 
           try {

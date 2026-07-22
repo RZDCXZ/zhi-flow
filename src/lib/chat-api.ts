@@ -1,4 +1,5 @@
 export const MAX_CHAT_MESSAGE_LENGTH = 4_000
+export const GENERAL_CHAT_CONTEXT_MESSAGE_LIMIT = 12
 
 export type ChatTokenUsage = Readonly<{
   inputTokens: number

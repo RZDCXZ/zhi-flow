@@ -17,7 +17,11 @@ describe("Chat Provider 合约", () => {
 
     const events = []
     for await (const event of provider.stream({
-      message: "什么是向量检索？",
+      messages: [
+        { role: "user", content: "什么是向量检索？" },
+        { role: "assistant", content: "它会按相似度查找相关内容。" },
+        { role: "user", content: "它适合处理追问吗？" },
+      ],
       signal: controller.signal,
     })) {
       events.push(event)
@@ -32,7 +36,14 @@ describe("Chat Provider 合约", () => {
       },
     ])
     expect(provider.requests).toEqual([
-      { message: "什么是向量检索？", signal: controller.signal },
+      {
+        messages: [
+          { role: "user", content: "什么是向量检索？" },
+          { role: "assistant", content: "它会按相似度查找相关内容。" },
+          { role: "user", content: "它适合处理追问吗？" },
+        ],
+        signal: controller.signal,
+      },
     ])
   })
 
@@ -70,7 +81,11 @@ describe("Chat Provider 合约", () => {
 
     const events = []
     for await (const event of provider.stream({
-      message: "解释向量检索。",
+      messages: [
+        { role: "user", content: "解释向量检索。" },
+        { role: "assistant", content: "它按向量相似度召回内容。" },
+        { role: "user", content: "再简短一点。" },
+      ],
       signal: controller.signal,
     })) {
       events.push(event)
@@ -101,7 +116,11 @@ describe("Chat Provider 合约", () => {
     expect(requests[0]?.init?.signal).toBe(controller.signal)
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
       model: "learning-model",
-      messages: [{ role: "user", content: "解释向量检索。" }],
+      messages: [
+        { role: "user", content: "解释向量检索。" },
+        { role: "assistant", content: "它按向量相似度召回内容。" },
+        { role: "user", content: "再简短一点。" },
+      ],
       stream: true,
       stream_options: { include_usage: true },
     })
@@ -124,7 +143,7 @@ describe("Chat Provider 合约", () => {
     await expect(
       (async () => {
         for await (const event of provider.stream({
-          message: "无法解析的响应。",
+          messages: [{ role: "user", content: "无法解析的响应。" }],
           signal: controller.signal,
         })) {
           void event

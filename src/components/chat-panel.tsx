@@ -19,6 +19,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import {
+  GENERAL_CHAT_CONTEXT_MESSAGE_LIMIT,
   MAX_CHAT_MESSAGE_LENGTH,
   type ChatErrorResponse,
   type ChatTokenUsage,
@@ -319,7 +320,7 @@ export function ChatPanel() {
         <CardHeader className="gap-2">
           <CardTitle className="text-xl">输入消息</CardTitle>
           <CardDescription className="text-base leading-relaxed">
-            Message 会在生成前持久化；刷新后可从数据库恢复。
+            {`通用聊天发送最近 ${GENERAL_CHAT_CONTEXT_MESSAGE_LIMIT} 条已完成 Message；生成后显示输入 Token、输出 Token 与总量。`}
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-6">
@@ -367,8 +368,8 @@ export function ChatPanel() {
 
           {usage && latencyMs !== null ? (
             <p className="text-sm text-muted-foreground">
-              {latencyMs} ms · 输入 {usage.inputTokens} · 输出{" "}
-              {usage.outputTokens}· 总计 {usage.totalTokens} tokens
+              {latencyMs} ms · 输入 Token {usage.inputTokens} · 输出 Token{" "}
+              {usage.outputTokens} · 总 Token {usage.totalTokens}
             </p>
           ) : null}
 
