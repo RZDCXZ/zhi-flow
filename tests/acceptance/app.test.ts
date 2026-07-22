@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process"
+import { writeFileSync } from "node:fs"
+import { rm } from "node:fs/promises"
 import {
   createServer as createHttpServer,
   type IncomingMessage,
@@ -9,12 +11,17 @@ import { createServer } from "node:net"
 import { afterEach, describe, expect, it } from "vitest"
 
 const runningProcesses = new Set<ChildProcess>()
+const testArtifactDirectories = new Set<string>()
 
-afterEach(() => {
-  for (const process of runningProcesses) {
-    process.kill("SIGTERM")
-  }
+afterEach(async () => {
+  await Promise.all([...runningProcesses].map(stopProcess))
   runningProcesses.clear()
+  await Promise.all(
+    [...testArtifactDirectories].map((directory) =>
+      rm(directory, { recursive: true, force: true }),
+    ),
+  )
+  testArtifactDirectories.clear()
 })
 
 describe("Zhi Flow Web 服务", () => {
@@ -584,7 +591,7 @@ async function withDevelopmentServer(
     await waitUntilReachable(baseUrl)
     await assertions(baseUrl)
   } finally {
-    application.kill("SIGTERM")
+    await stopProcess(application)
   }
 }
 
@@ -651,6 +658,14 @@ function startNextDevelopmentServer(
   port: number,
   environment: NodeJS.ProcessEnv,
 ): ChildProcess {
+  const distDir = `.next-acceptance-${port}`
+  const tsconfigPath = `.next-acceptance-${port}.tsconfig.json`
+  testArtifactDirectories.add(distDir)
+  testArtifactDirectories.add(tsconfigPath)
+  writeFileSync(
+    tsconfigPath,
+    `${JSON.stringify({ extends: "./tsconfig.json" }, null, 2)}\n`,
+  )
   const application = spawn(
     process.execPath,
     [
@@ -663,7 +678,11 @@ function startNextDevelopmentServer(
     ],
     {
       cwd: process.cwd(),
-      env: environment,
+      env: {
+        ...environment,
+        ZHI_FLOW_NEXT_DIST_DIR: distDir,
+        ZHI_FLOW_NEXT_TSCONFIG_PATH: tsconfigPath,
+      },
       stdio: "pipe",
     },
   )
@@ -671,6 +690,19 @@ function startNextDevelopmentServer(
   runningProcesses.add(application)
   application.once("exit", () => runningProcesses.delete(application))
   return application
+}
+
+async function stopProcess(application: ChildProcess): Promise<void> {
+  if (application.exitCode !== null || application.signalCode !== null) return
+
+  await new Promise<void>((resolve) => {
+    const forceStop = setTimeout(() => application.kill("SIGKILL"), 5_000)
+    application.once("exit", () => {
+      clearTimeout(forceStop)
+      resolve()
+    })
+    application.kill("SIGTERM")
+  })
 }
 
 async function waitForExit(
