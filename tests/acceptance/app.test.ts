@@ -208,6 +208,11 @@ describe("Zhi Flow Web 服务", () => {
             expect(duplicateResponse.status).toBe(409)
             await expect(duplicateResponse.json()).resolves.toMatchObject({
               error: { code: "IDEMPOTENCY_REPLAY" },
+              submission: {
+                userMessageId: events[0]?.data.userMessageId,
+                assistantMessageId: events[0]?.data.assistantMessageId,
+                assistantMessageStatus: "completed",
+              },
             })
             expect(upstreamRequests).toBe(1)
 
@@ -320,12 +325,7 @@ describe("Zhi Flow Web 服务", () => {
               "不应出现的取消正文",
               "cancelled",
             )
-            await insertAttempt(
-              2,
-              "未完成问题",
-              "不应出现的流式正文",
-              "streaming",
-            )
+            await insertAttempt(2, "中断问题", "不应出现的中断正文", "failed")
 
             const isolated = (await (
               await fetch(`${baseUrl}/api/conversations`, {
@@ -357,7 +357,7 @@ describe("Zhi Flow Web 服务", () => {
                 { role: "assistant", content: "续聊成功" },
                 { role: "user", content: "失败问题" },
                 { role: "user", content: "取消问题" },
-                { role: "user", content: "未完成问题" },
+                { role: "user", content: "中断问题" },
                 { role: "user", content: "失败后继续。" },
               ],
             ])

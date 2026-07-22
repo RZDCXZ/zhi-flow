@@ -36,7 +36,7 @@ curl http://localhost:3000/api/conversations \
   -d '{"title":"向量检索学习"}'
 ```
 
-再把返回的 Conversation ID 传给聊天接口；`clientIdempotencyKey` 在同一 Conversation 内不可重复：
+再把返回的 Conversation ID 传给聊天接口；`clientIdempotencyKey` 在同一 Conversation 内标识一次提交，相同正文可以安全重放，不同正文不能复用：
 
 ```bash
 curl http://localhost:3000/api/chat \
@@ -103,7 +103,9 @@ flowchart LR
 | ------------------------------ | -------------------- | -------------------------------- | ------ |
 | 空输入或请求结构无效           | HTTP 400             | `INVALID_INPUT`                  | 否     |
 | 超过 4000 个字符               | HTTP 400             | `INPUT_TOO_LONG`                 | 否     |
-| 重复客户端幂等键               | HTTP 409             | `IDEMPOTENCY_REPLAY`             | 否     |
+| 相同正文重放客户端幂等键       | HTTP 409             | `IDEMPOTENCY_REPLAY`             | 否     |
+| 不同正文复用客户端幂等键       | HTTP 409             | `IDEMPOTENCY_KEY_REUSED`         | 否     |
+| Conversation 已有活动生成      | HTTP 409             | `GENERATION_IN_PROGRESS`         | 否     |
 | 供应商超时                     | SSE `message.failed` | `PROVIDER_TIMEOUT`               | 是     |
 | 供应商 401/403                 | SSE `message.failed` | `PROVIDER_AUTHENTICATION_FAILED` | 否     |
 | 供应商 429                     | SSE `message.failed` | `RATE_LIMITED`                   | 是     |
@@ -132,7 +134,7 @@ npm run db:stop  # 停止本项目的本地 Supabase 容器
 - `src/app/api/health/route.ts` 是服务端 Route Handler，通过 HTTP 返回最小健康状态。
 - `src/app/api/conversations/` 提供 Conversation 创建、列表、读取历史、重命名和删除。
 - `src/app/api/chat/route.ts` 只接受通用 Conversation，在流开始前组装多轮上下文并创建 Message 对，边流边持久化正文，最后写入完成、取消或失败终态。
-- `src/server/conversations.ts` 集中 Conversation/Message 的数据库操作；上下文查询只取同一 Conversation 的最近已完成 Message，`create_message_attempt` RPC 保证用户 Message 与助手尝试原子创建并处理幂等重放。
+- `src/server/conversations.ts` 集中 Conversation/Message 的数据库操作；上下文查询只取同一 Conversation 的最近已完成 Message，`create_message_submission` RPC 按 Conversation 原子裁决创建、幂等重放、键复用冲突和单活动生成冲突。
 - `src/server/chat/` 定义 Provider 合约、可控假 Provider 与 OpenAI-compatible 实现；供应商配置只从服务端配置进入真实实现。
 - `src/server/config-definition.ts` 是唯一配置定义与校验入口；`next.config.ts` 在启动阶段调用它，`src/server/config.ts` 为后续服务端业务提供只读配置。
 - `src/server/supabase.ts` 是服务端特权数据客户端入口；禁用会话持久化，不提供浏览器端 Supabase 客户端。

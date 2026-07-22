@@ -1,8 +1,12 @@
-import { MAX_CHAT_MESSAGE_LENGTH, type ChatTokenUsage } from "@/lib/chat-api"
+import {
+  MAX_CHAT_MESSAGE_LENGTH,
+  type ChatTokenUsage,
+  type ExistingMessageSubmission,
+} from "@/lib/chat-api"
 import {
   appendAssistantContent,
   cancelAssistantMessage,
-  createMessageAttempt,
+  createMessageSubmission,
   finishAssistantMessage,
   isAssistantMessageStreaming,
   readChatContext,
@@ -20,6 +24,8 @@ export type AssistantMessageGenerationError = Readonly<{
     | "INVALID_INPUT"
     | "INPUT_TOO_LONG"
     | "IDEMPOTENCY_REPLAY"
+    | "IDEMPOTENCY_KEY_REUSED"
+    | "GENERATION_IN_PROGRESS"
     | "UNSUPPORTED_CONVERSATION_MODE"
     | "PROVIDER_AUTHENTICATION_FAILED"
     | "RATE_LIMITED"
@@ -66,13 +72,26 @@ export type StartGenerationResult =
   | Readonly<{
       type:
         | "invalid-input"
-        | "request-in-progress"
         | "input-too-long"
         | "context-unavailable"
         | "conversation-not-found"
         | "unsupported-mode"
         | "message-creation-failed"
-        | "idempotency-replay"
+      error: AssistantMessageGenerationError
+    }>
+  | Readonly<{
+      type: "idempotency-replay"
+      submission: ExistingMessageSubmission
+      error: AssistantMessageGenerationError
+    }>
+  | Readonly<{
+      type: "idempotency-key-reused"
+      userMessageId: string
+      error: AssistantMessageGenerationError
+    }>
+  | Readonly<{
+      type: "generation-in-progress"
+      assistantMessageId: string
       error: AssistantMessageGenerationError
     }>
 
@@ -148,20 +167,6 @@ export class AssistantMessageGenerationModule {
         },
       }
     }
-    if (
-      request.requestId !== undefined &&
-      this.activeGenerations.has(request.requestId)
-    ) {
-      return {
-        type: "request-in-progress",
-        error: {
-          code: "INVALID_INPUT",
-          message: "该请求正在生成中。",
-          retryable: false,
-        },
-      }
-    }
-
     let context
     try {
       context = await readChatContext(request.conversationId)
@@ -198,7 +203,7 @@ export class AssistantMessageGenerationModule {
 
     let attempt
     try {
-      attempt = await createMessageAttempt(
+      attempt = await createMessageSubmission(
         request.conversationId,
         message,
         request.clientIdempotencyKey,
@@ -213,12 +218,39 @@ export class AssistantMessageGenerationModule {
         },
       }
     }
-    if (attempt.duplicate || attempt.assistantMessageId === null) {
+    if (attempt.outcome === "idempotency-replay") {
       return {
         type: "idempotency-replay",
+        submission: {
+          userMessageId: attempt.userMessageId,
+          assistantMessageId: attempt.assistantMessageId,
+          assistantMessageStatus: attempt.assistantMessageStatus,
+        },
         error: {
           code: "IDEMPOTENCY_REPLAY",
           message: "这条消息已经提交过。",
+          retryable: false,
+        },
+      }
+    }
+    if (attempt.outcome === "idempotency-key-reused") {
+      return {
+        type: "idempotency-key-reused",
+        userMessageId: attempt.userMessageId,
+        error: {
+          code: "IDEMPOTENCY_KEY_REUSED",
+          message: "该幂等键已用于另一条消息。",
+          retryable: false,
+        },
+      }
+    }
+    if (attempt.outcome === "generation-in-progress") {
+      return {
+        type: "generation-in-progress",
+        assistantMessageId: attempt.assistantMessageId,
+        error: {
+          code: "GENERATION_IN_PROGRESS",
+          message: "该 Conversation 已有正在生成的 Assistant Message。",
           retryable: false,
         },
       }

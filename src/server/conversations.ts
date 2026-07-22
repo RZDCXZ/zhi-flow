@@ -153,19 +153,29 @@ export async function deleteConversation(
   return data !== null
 }
 
-export type MessageAttempt = Readonly<{
-  userMessageId: string
-  assistantMessageId: string | null
-  duplicate: boolean
-}>
+export type MessageSubmissionResult =
+  | Readonly<{
+      outcome: "created" | "idempotency-replay"
+      userMessageId: string
+      assistantMessageId: string
+      assistantMessageStatus: Message["status"]
+    }>
+  | Readonly<{
+      outcome: "idempotency-key-reused"
+      userMessageId: string
+    }>
+  | Readonly<{
+      outcome: "generation-in-progress"
+      assistantMessageId: string
+    }>
 
-export async function createMessageAttempt(
+export async function createMessageSubmission(
   conversationId: string,
   content: string,
   clientIdempotencyKey: string,
-): Promise<MessageAttempt> {
+): Promise<MessageSubmissionResult> {
   const { data, error } = await createServerDataClient().rpc(
-    "create_message_attempt",
+    "create_message_submission",
     {
       target_conversation_id: conversationId,
       user_content: content,
@@ -175,17 +185,46 @@ export async function createMessageAttempt(
   if (error) throw error
   const row = data?.[0] as
     | {
-        user_message_id: string
+        outcome: string
+        user_message_id: string | null
         assistant_message_id: string | null
-        duplicate: boolean
+        assistant_message_status: Message["status"] | null
       }
     | undefined
-  if (row === undefined) throw new Error("Message attempt was not created")
+  if (row === undefined) throw new Error("Message submission was not created")
+  if (row.outcome === "idempotency_key_reused") {
+    if (row.user_message_id === null) throw invalidMessageSubmissionResult()
+    return {
+      outcome: "idempotency-key-reused",
+      userMessageId: row.user_message_id,
+    }
+  }
+  if (row.outcome === "generation_in_progress") {
+    if (row.assistant_message_id === null)
+      throw invalidMessageSubmissionResult()
+    return {
+      outcome: "generation-in-progress",
+      assistantMessageId: row.assistant_message_id,
+    }
+  }
+  if (
+    (row.outcome !== "created" && row.outcome !== "idempotency_replay") ||
+    row.user_message_id === null ||
+    row.assistant_message_id === null ||
+    row.assistant_message_status === null
+  ) {
+    throw invalidMessageSubmissionResult()
+  }
   return {
+    outcome: row.outcome === "created" ? "created" : "idempotency-replay",
     userMessageId: row.user_message_id,
     assistantMessageId: row.assistant_message_id,
-    duplicate: row.duplicate,
+    assistantMessageStatus: row.assistant_message_status,
   }
+}
+
+function invalidMessageSubmissionResult(): Error {
+  return new Error("Message submission returned an invalid result")
 }
 
 export async function appendAssistantContent(

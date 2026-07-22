@@ -1,3 +1,5 @@
+import type { MessageStatus } from "./conversation-api"
+
 export const MAX_CHAT_MESSAGE_LENGTH = 4_000
 export const GENERAL_CHAT_CONTEXT_MESSAGE_LIMIT = 12
 
@@ -15,6 +17,8 @@ export type ChatErrorCode =
   | "INVALID_INPUT"
   | "INPUT_TOO_LONG"
   | "IDEMPOTENCY_REPLAY"
+  | "IDEMPOTENCY_KEY_REUSED"
+  | "GENERATION_IN_PROGRESS"
   | "UNSUPPORTED_CONVERSATION_MODE"
   | "PROVIDER_AUTHENTICATION_FAILED"
   | "RATE_LIMITED"
@@ -23,12 +27,21 @@ export type ChatErrorCode =
   | "STREAM_INTERRUPTED"
   | "INTERNAL_ERROR"
 
+export type ExistingMessageSubmission = Readonly<{
+  userMessageId: string
+  assistantMessageId: string
+  assistantMessageStatus: MessageStatus
+}>
+
 export type ChatErrorResponse = Readonly<{
   error: Readonly<{
     code: ChatErrorCode
     message: string
     retryable: boolean
   }>
+  submission?: ExistingMessageSubmission
+  userMessageId?: string
+  assistantMessageId?: string
 }>
 
 export const CHAT_STREAM_PROTOCOL_VERSION = 1 as const

@@ -30,10 +30,13 @@ export async function POST(request: Request) {
     disconnected: request.signal,
   })
   if (result.type !== "started") {
-    return chatError({
-      ...result.error,
-      status: startFailureStatus[result.type],
-    })
+    return chatError(
+      {
+        ...result.error,
+        status: startFailureStatus[result.type],
+      },
+      startFailureDetails(result),
+    )
   }
 
   return new Response(
@@ -82,12 +85,13 @@ export async function DELETE(request: Request) {
 const startFailureStatus = {
   "invalid-input": 400,
   "input-too-long": 400,
-  "request-in-progress": 409,
   "context-unavailable": 503,
   "conversation-not-found": 404,
   "unsupported-mode": 422,
   "message-creation-failed": 404,
   "idempotency-replay": 409,
+  "idempotency-key-reused": 409,
+  "generation-in-progress": 409,
 } satisfies Record<
   Exclude<
     Awaited<ReturnType<typeof assistantMessageGeneration.start>>["type"],
@@ -213,9 +217,30 @@ function isNonEmptyBoundedString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 128
 }
 
-function chatError({ status, ...error }: ChatErrorDefinition) {
+function startFailureDetails(
+  result: Exclude<
+    Awaited<ReturnType<typeof assistantMessageGeneration.start>>,
+    { type: "started" }
+  >,
+): Omit<ChatErrorResponse, "error"> {
+  if (result.type === "idempotency-replay") {
+    return { submission: result.submission }
+  }
+  if (result.type === "idempotency-key-reused") {
+    return { userMessageId: result.userMessageId }
+  }
+  if (result.type === "generation-in-progress") {
+    return { assistantMessageId: result.assistantMessageId }
+  }
+  return {}
+}
+
+function chatError(
+  { status, ...error }: ChatErrorDefinition,
+  details: Omit<ChatErrorResponse, "error"> = {},
+) {
   return Response.json(
-    { error },
+    { error, ...details },
     { status, headers: { "Cache-Control": "no-store" } },
   )
 }
