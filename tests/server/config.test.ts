@@ -12,28 +12,42 @@ const validEnvironment: NodeJS.ProcessEnv = {
 }
 
 describe("服务端配置", () => {
-  it("提供 OpenAI-compatible 聊天配置与可覆盖的超时", () => {
+  it("提供 OpenAI-compatible 聊天配置与可覆盖的流式超时", () => {
     const config = loadServerConfig({
       ...validEnvironment,
-      ZHI_FLOW_CHAT_TIMEOUT_MS: "2500",
+      ZHI_FLOW_CHAT_FIRST_BYTE_TIMEOUT_MS: "2500",
+      ZHI_FLOW_CHAT_IDLE_TIMEOUT_MS: "3500",
+      ZHI_FLOW_CHAT_TOTAL_TIMEOUT_MS: "4500",
+      ZHI_FLOW_CHAT_HEARTBEAT_INTERVAL_MS: "500",
+      ZHI_FLOW_CHAT_MAX_STREAM_ATTEMPTS: "4",
     })
 
     expect(config.chat).toEqual({
       apiKey: "test-chat-secret",
       baseUrl: "https://example.test/v1",
       model: "test-chat-model",
-      timeoutMs: 2_500,
+      firstByteTimeoutMs: 2_500,
+      idleTimeoutMs: 3_500,
+      totalTimeoutMs: 4_500,
+      heartbeatIntervalMs: 500,
+      maxStreamAttempts: 4,
     })
   })
 
   it("聊天超时未配置时使用安全默认值，并拒绝非正整数", () => {
-    expect(loadServerConfig(validEnvironment).chat.timeoutMs).toBe(15_000)
+    expect(loadServerConfig(validEnvironment).chat).toMatchObject({
+      firstByteTimeoutMs: 15_000,
+      idleTimeoutMs: 30_000,
+      totalTimeoutMs: 120_000,
+      heartbeatIntervalMs: 10_000,
+      maxStreamAttempts: 3,
+    })
     expect(() =>
       loadServerConfig({
         ...validEnvironment,
-        ZHI_FLOW_CHAT_TIMEOUT_MS: "0",
+        ZHI_FLOW_CHAT_FIRST_BYTE_TIMEOUT_MS: "0",
       }),
-    ).toThrowError(/ZHI_FLOW_CHAT_TIMEOUT_MS/)
+    ).toThrowError(/ZHI_FLOW_CHAT_FIRST_BYTE_TIMEOUT_MS/)
   })
 
   it("提供仅供服务端数据访问使用的 Supabase 配置", () => {

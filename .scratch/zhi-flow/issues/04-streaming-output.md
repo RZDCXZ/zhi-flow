@@ -1,7 +1,7 @@
 # 04 流式输出
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 03
 
 ## 学习目标
@@ -38,3 +38,9 @@ Blocked by: 03
 - 消息持久化、刷新恢复、重生成和 RAG 事件。
 
 ## Comments
+
+- 已实现 SSE 协议 v1、OpenAI-compatible 增量解码、注释心跳、首字节/空闲/总时限、正文前有限重试、正文后禁止自动重启，以及用量和 completed/cancelled/failed 三类终态。
+- 正常时间线为 `message.created → content.delta → content.delta → usage.snapshot → message.completed`；所有事件携带同一 requestId、单调 sequence 和时间戳。
+- 停止时间线为 `message.created → content.delta → message.cancelled`，浏览器保留已显示正文并提示“已停止生成”；假上游连接关闭，确认取消已传播至 Provider。
+- 中断时间线为 `message.created → content.delta → message.failed(STREAM_INTERRUPTED)`，上游请求次数为 1；首个正文前超时则最多尝试 3 次，最终只产生一个 `message.failed(PROVIDER_TIMEOUT)`。
+- 已通过 Provider/客户端增量解码单测、15 条公开 HTTP/SSE 验收路径、真实浏览器渐进显示与停止冒烟；里程碑 5 仍等待用户明确决定后再进入。

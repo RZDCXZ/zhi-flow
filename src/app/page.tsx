@@ -32,11 +32,11 @@ export default function HomePage() {
       <main className="mx-auto flex w-full max-w-7xl flex-col justify-center gap-10 px-5 py-12 sm:px-8 sm:py-16">
         <div className="max-w-3xl space-y-4">
           <h1 className="text-4xl leading-tight font-semibold tracking-[-0.04em] sm:text-6xl">
-            进行一次非流式聊天
+            观察回答逐步生成
           </h1>
           <p className="max-w-2xl text-lg leading-relaxed text-muted-foreground sm:text-xl">
-            发送一条消息，观察服务端如何调用模型，并查看端到端延迟与 token
-            用量。
+            发送一条消息，观察 SSE
+            正文增量、心跳与终态；生成过程中可以随时停止。
           </p>
         </div>
 
@@ -44,7 +44,7 @@ export default function HomePage() {
       </main>
 
       <footer className="border-t bg-muted/30 py-7 text-center text-sm text-muted-foreground sm:text-base">
-        里程碑 03 · 非流式单轮聊天
+        里程碑 04 · 流式输出与取消
       </footer>
     </div>
   )

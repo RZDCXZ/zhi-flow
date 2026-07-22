@@ -13,7 +13,11 @@ export type ServerConfig = Readonly<{
     apiKey: string
     baseUrl: string
     model: string
-    timeoutMs: number
+    firstByteTimeoutMs: number
+    idleTimeoutMs: number
+    totalTimeoutMs: number
+    heartbeatIntervalMs: number
+    maxStreamAttempts: number
   }>
   supabase: Readonly<{
     url: string
@@ -50,7 +54,31 @@ export function loadServerConfig(
       apiKey: values.get("ZHI_FLOW_CHAT_API_KEY")!,
       baseUrl,
       model: values.get("ZHI_FLOW_CHAT_MODEL")!,
-      timeoutMs: loadChatTimeoutMs(environment),
+      firstByteTimeoutMs: loadPositiveInteger(
+        environment,
+        "ZHI_FLOW_CHAT_FIRST_BYTE_TIMEOUT_MS",
+        15_000,
+      ),
+      idleTimeoutMs: loadPositiveInteger(
+        environment,
+        "ZHI_FLOW_CHAT_IDLE_TIMEOUT_MS",
+        30_000,
+      ),
+      totalTimeoutMs: loadPositiveInteger(
+        environment,
+        "ZHI_FLOW_CHAT_TOTAL_TIMEOUT_MS",
+        120_000,
+      ),
+      heartbeatIntervalMs: loadPositiveInteger(
+        environment,
+        "ZHI_FLOW_CHAT_HEARTBEAT_INTERVAL_MS",
+        10_000,
+      ),
+      maxStreamAttempts: loadPositiveInteger(
+        environment,
+        "ZHI_FLOW_CHAT_MAX_STREAM_ATTEMPTS",
+        3,
+      ),
     }),
     supabase: Object.freeze({
       url: supabaseUrl,
@@ -59,16 +87,20 @@ export function loadServerConfig(
   })
 }
 
-function loadChatTimeoutMs(environment: NodeJS.ProcessEnv): number {
-  const configuredValue = environment.ZHI_FLOW_CHAT_TIMEOUT_MS?.trim()
-  if (!configuredValue) return 15_000
+function loadPositiveInteger(
+  environment: NodeJS.ProcessEnv,
+  variable: string,
+  defaultValue: number,
+): number {
+  const configuredValue = environment[variable]?.trim()
+  if (!configuredValue) return defaultValue
 
-  const timeoutMs = Number(configuredValue)
-  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
-    throw new Error("后端配置无效：ZHI_FLOW_CHAT_TIMEOUT_MS 必须是正整数毫秒值")
+  const value = Number(configuredValue)
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`后端配置无效：${variable} 必须是正整数`)
   }
 
-  return timeoutMs
+  return value
 }
 
 function assertHttpUrl(variable: RequiredVariable, value: string): void {

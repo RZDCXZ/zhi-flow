@@ -1,5 +1,11 @@
-import type { ChatCompletion, ChatProvider, ChatRequest } from "./chat-provider"
+import type {
+  ChatProvider,
+  ChatProviderStreamEvent,
+  ChatRequest,
+} from "./chat-provider"
 import { ChatProviderError } from "./chat-provider"
+import { takeSseFrame } from "../../lib/sse"
+import { isChatTokenCount } from "../../lib/chat-api"
 
 type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
@@ -7,7 +13,6 @@ type OpenAiCompatibleConfig = Readonly<{
   apiKey: string
   baseUrl: string
   model: string
-  timeoutMs: number
 }>
 
 export class OpenAiCompatibleChatProvider implements ChatProvider {
@@ -16,7 +21,7 @@ export class OpenAiCompatibleChatProvider implements ChatProvider {
     private readonly fetchImplementation: Fetch = fetch,
   ) {}
 
-  async complete(request: ChatRequest): Promise<ChatCompletion> {
+  async *stream(request: ChatRequest): AsyncGenerator<ChatProviderStreamEvent> {
     let response: Response
     try {
       response = await this.fetchImplementation(
@@ -25,93 +30,162 @@ export class OpenAiCompatibleChatProvider implements ChatProvider {
           method: "POST",
           headers: {
             Authorization: `Bearer ${this.config.apiKey}`,
+            Accept: "text/event-stream",
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
             model: this.config.model,
             messages: [{ role: "user", content: request.message }],
-            stream: false,
+            stream: true,
+            stream_options: { include_usage: true },
           }),
-          signal: AbortSignal.timeout(this.config.timeoutMs),
+          signal: request.signal,
         },
       )
-    } catch (error) {
-      if (
-        error instanceof DOMException &&
-        (error.name === "TimeoutError" || error.name === "AbortError")
-      ) {
-        throw new ChatProviderError("timeout")
-      }
-      throw new ChatProviderError("unavailable")
-    }
-
-    if (response.status === 401 || response.status === 403) {
-      throw new ChatProviderError("authentication")
-    }
-    if (response.status === 429) {
-      throw new ChatProviderError("rate_limit")
-    }
-    if (response.status >= 500) {
-      throw new ChatProviderError("unavailable")
-    }
-    if (!response.ok) {
-      throw new ChatProviderError("invalid_response")
-    }
-
-    let body: unknown
-    try {
-      body = await response.json()
     } catch {
-      throw new ChatProviderError("invalid_response")
+      if (request.signal.aborted) throw abortError()
+      throw new ChatProviderError("unavailable")
     }
 
-    const completion = readCompletion(body)
-    if (completion === null) {
-      throw new ChatProviderError("invalid_response")
+    assertSuccessfulResponse(response)
+    if (response.body === null) throw new ChatProviderError("invalid_response")
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ""
+    let receivedDone = false
+
+    try {
+      while (!receivedDone) {
+        const chunk = await reader.read()
+        if (chunk.done) break
+        if (chunk.value.byteLength > 0) yield { type: "activity" }
+        buffer += decoder.decode(chunk.value, { stream: true })
+
+        let frame
+        while ((frame = takeSseFrame(buffer)) !== null) {
+          buffer = frame.rest
+          const parsed = readFrame(frame.value)
+          if (parsed === "done") {
+            receivedDone = true
+            break
+          }
+          for (const event of parsed) yield event
+        }
+      }
+      buffer += decoder.decode()
+    } catch (error) {
+      if (request.signal.aborted) throw abortError()
+      if (error instanceof ChatProviderError) throw error
+      throw new ChatProviderError("interrupted")
+    } finally {
+      reader.releaseLock()
     }
 
-    return completion
+    if (!receivedDone || buffer.trim()) {
+      throw new ChatProviderError("interrupted")
+    }
   }
 }
 
-function readCompletion(body: unknown): ChatCompletion | null {
+function assertSuccessfulResponse(response: Response): void {
+  if (response.status === 401 || response.status === 403) {
+    throw new ChatProviderError("authentication")
+  }
+  if (response.status === 429) throw new ChatProviderError("rate_limit")
+  if (response.status >= 500) throw new ChatProviderError("unavailable")
+  if (!response.ok) throw new ChatProviderError("invalid_response")
+}
+
+function readFrame(frame: string): readonly ChatProviderStreamEvent[] | "done" {
+  const lines = frame.split(/\r?\n/)
+  const data = lines
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).replace(/^ /, ""))
+    .join("\n")
+
+  if (!data) return []
+  if (data === "[DONE]") return "done"
+
+  let body: unknown
+  try {
+    body = JSON.parse(data)
+  } catch {
+    throw new ChatProviderError("invalid_response")
+  }
+
+  const events: ChatProviderStreamEvent[] = []
+  const delta = readContentDelta(body)
+  if (delta !== null && delta !== "") {
+    events.push({ type: "content.delta", delta })
+  }
+  const usage = readUsage(body)
+  if (usage !== null) events.push({ type: "usage.snapshot", usage })
+  if (events.length === 0) events.push({ type: "activity" })
+  return events
+}
+
+function readContentDelta(body: unknown): string | null {
   if (
     typeof body !== "object" ||
     body === null ||
     !("choices" in body) ||
     !Array.isArray(body.choices) ||
-    body.choices.length === 0 ||
-    typeof body.choices[0] !== "object" ||
-    body.choices[0] === null ||
-    !("message" in body.choices[0]) ||
-    typeof body.choices[0].message !== "object" ||
-    body.choices[0].message === null ||
-    !("content" in body.choices[0].message) ||
-    typeof body.choices[0].message.content !== "string" ||
-    !body.choices[0].message.content.trim() ||
-    !("usage" in body) ||
-    typeof body.usage !== "object" ||
-    body.usage === null ||
-    !("prompt_tokens" in body.usage) ||
-    !isTokenCount(body.usage.prompt_tokens) ||
-    !("completion_tokens" in body.usage) ||
-    !isTokenCount(body.usage.completion_tokens) ||
-    !("total_tokens" in body.usage) ||
-    !isTokenCount(body.usage.total_tokens)
+    body.choices.length === 0
   ) {
     return null
   }
 
+  const choice: unknown = body.choices[0]
+  if (
+    typeof choice !== "object" ||
+    choice === null ||
+    !("delta" in choice) ||
+    typeof choice.delta !== "object" ||
+    choice.delta === null ||
+    !("content" in choice.delta)
+  ) {
+    return null
+  }
+  if (choice.delta.content === null) return null
+  if (typeof choice.delta.content !== "string") {
+    throw new ChatProviderError("invalid_response")
+  }
+  return choice.delta.content
+}
+
+function readUsage(body: unknown) {
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    !("usage" in body) ||
+    body.usage === null
+  ) {
+    return null
+  }
+  if (typeof body.usage !== "object") {
+    throw new ChatProviderError("invalid_response")
+  }
+
+  const usage = body.usage
+  if (
+    !("prompt_tokens" in usage) ||
+    !isChatTokenCount(usage.prompt_tokens) ||
+    !("completion_tokens" in usage) ||
+    !isChatTokenCount(usage.completion_tokens) ||
+    !("total_tokens" in usage) ||
+    !isChatTokenCount(usage.total_tokens)
+  ) {
+    throw new ChatProviderError("invalid_response")
+  }
+
   return {
-    answer: body.choices[0].message.content,
-    usage: {
-      inputTokens: body.usage.prompt_tokens,
-      outputTokens: body.usage.completion_tokens,
-      totalTokens: body.usage.total_tokens,
-    },
+    inputTokens: usage.prompt_tokens,
+    outputTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens,
   }
 }
 
-function isTokenCount(value: unknown): value is number {
-  return Number.isInteger(value) && Number(value) >= 0
+function abortError(): DOMException {
+  return new DOMException("Chat stream was cancelled", "AbortError")
 }

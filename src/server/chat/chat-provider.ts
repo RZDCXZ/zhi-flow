@@ -2,15 +2,16 @@ import type { ChatTokenUsage } from "../../lib/chat-api"
 
 export type ChatRequest = Readonly<{
   message: string
+  signal: AbortSignal
 }>
 
-export type ChatCompletion = Readonly<{
-  answer: string
-  usage: ChatTokenUsage
-}>
+export type ChatProviderStreamEvent =
+  | Readonly<{ type: "activity" }>
+  | Readonly<{ type: "content.delta"; delta: string }>
+  | Readonly<{ type: "usage.snapshot"; usage: ChatTokenUsage }>
 
 export interface ChatProvider {
-  complete(request: ChatRequest): Promise<ChatCompletion>
+  stream(request: ChatRequest): AsyncIterable<ChatProviderStreamEvent>
 }
 
 export type ChatProviderErrorKind =
@@ -19,6 +20,7 @@ export type ChatProviderErrorKind =
   | "unavailable"
   | "invalid_response"
   | "timeout"
+  | "interrupted"
 
 export class ChatProviderError extends Error {
   readonly name = "ChatProviderError"

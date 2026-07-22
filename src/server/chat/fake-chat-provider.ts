@@ -1,15 +1,19 @@
-import type { ChatCompletion, ChatProvider, ChatRequest } from "./chat-provider"
+import type {
+  ChatProvider,
+  ChatProviderStreamEvent,
+  ChatRequest,
+} from "./chat-provider"
 
 type FakeChatResponder = (
   request: ChatRequest,
-) => ChatCompletion | Promise<ChatCompletion>
+) => AsyncIterable<ChatProviderStreamEvent>
 
 export class FakeChatProvider implements ChatProvider {
   readonly requests: ChatRequest[] = []
 
   constructor(private readonly respond: FakeChatResponder) {}
 
-  async complete(request: ChatRequest): Promise<ChatCompletion> {
+  stream(request: ChatRequest): AsyncIterable<ChatProviderStreamEvent> {
     this.requests.push(request)
     return this.respond(request)
   }
