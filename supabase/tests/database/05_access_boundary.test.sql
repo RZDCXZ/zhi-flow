@@ -1,6 +1,6 @@
 begin;
 
-select plan(8);
+select plan(11);
 
 select ok(
   exists(select 1 from storage.buckets where id = 'documents'),
@@ -26,6 +26,7 @@ select is(
     where oid in (
       'public.knowledge_bases'::regclass,
       'public.documents'::regclass,
+      'public.document_ingestion_enqueues'::regclass,
       'public.document_chunks'::regclass,
       'public.conversations'::regclass,
       'public.messages'::regclass,
@@ -34,7 +35,7 @@ select is(
     )
       and relrowsecurity
   ),
-  7,
+  8,
   'all application tables enable row-level security'
 );
 
@@ -64,6 +65,36 @@ select is(
   ),
   false,
   'anonymous clients cannot invoke internal consistency functions'
+);
+
+select is(
+  has_table_privilege(
+    'anon',
+    'public.document_ingestion_enqueues',
+    'select'
+  ),
+  false,
+  'anonymous clients cannot read Document enqueue registrations'
+);
+
+select is(
+  has_function_privilege(
+    'anon',
+    'public.enqueue_document_ingestion(uuid)',
+    'execute'
+  ),
+  false,
+  'anonymous clients cannot enqueue Documents'
+);
+
+select is(
+  has_function_privilege(
+    'service_role',
+    'public.enqueue_document_ingestion(uuid)',
+    'execute'
+  ),
+  true,
+  'the server service role can enqueue Documents'
 );
 
 select * from finish();

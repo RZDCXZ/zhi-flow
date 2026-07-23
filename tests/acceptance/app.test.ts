@@ -260,7 +260,7 @@ describe("Zhi Flow Web 服务", () => {
     })
   })
 
-  it("上传合法 TXT 至私有 Storage，创建 uploaded Document，并随 Knowledge Base 删除", async () => {
+  it("上传合法 TXT 至私有 Storage，创建 queued Document，并随 Knowledge Base 删除", async () => {
     await withDevelopmentServer(async (baseUrl) => {
       const created = (await (
         await fetch(`${baseUrl}/api/knowledge-bases`, {
@@ -295,8 +295,8 @@ describe("Zhi Flow Web 服务", () => {
         expect.objectContaining({
           id: expect.any(String),
           originalFilename: "guide.txt",
-          status: "uploaded",
-          currentStage: "stored",
+          status: "queued",
+          currentStage: "queue_pending",
         }),
       ])
 
@@ -311,7 +311,7 @@ describe("Zhi Flow Web 服务", () => {
         .eq("id", uploadBody.documents[0]!.id)
         .single()
       if (documentError) throw documentError
-      expect(storedDocument.status).toBe("uploaded")
+      expect(storedDocument.status).toBe("queued")
 
       const download = await dataClient.storage
         .from("documents")
@@ -352,6 +352,146 @@ describe("Zhi Flow Web 服务", () => {
       expect(cleanupJobs.error).toBeNull()
       expect(cleanupJobs.data).toEqual([])
     })
+  })
+
+  it("队列写入失败时保留 Document，并可幂等地手动重新入队", async () => {
+    await runLocalDatabaseSql("select pgmq.drop_queue('document_ingestion');")
+
+    try {
+      await withDevelopmentServer(async (baseUrl) => {
+        const created = (await (
+          await fetch(`${baseUrl}/api/knowledge-bases`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: "队列恢复验收" }),
+          })
+        ).json()) as { knowledgeBase: { id: string } }
+        const knowledgeBaseId = created.knowledgeBase.id
+        const uploadResponse = await fetch(
+          `${baseUrl}/api/knowledge-bases/${knowledgeBaseId}/documents`,
+          {
+            method: "POST",
+            body: filesForm([
+              new File(["只应留在私有 Storage。"], "recover.txt", {
+                type: "text/plain",
+              }),
+            ]),
+          },
+        )
+        const uploadBody = (await uploadResponse.json()) as {
+          documents: Array<{
+            id: string
+            status: string
+            currentStage: string
+            errorCode: string | null
+            errorSummary: string | null
+          }>
+        }
+        const document = uploadBody.documents[0]!
+
+        expect(uploadResponse.status).toBe(201)
+        expect(document).toMatchObject({
+          id: expect.any(String),
+          status: "uploaded",
+          currentStage: "enqueue_failed",
+          errorCode: "QUEUE_WRITE_FAILED",
+          errorSummary: expect.stringContaining("手动重新入队"),
+        })
+
+        const retryUrl =
+          `${baseUrl}/api/knowledge-bases/${knowledgeBaseId}` +
+          `/documents/${document.id}/enqueue`
+        const unavailableRetry = await fetch(retryUrl, { method: "POST" })
+        expect(unavailableRetry.status).toBe(503)
+        await expect(unavailableRetry.json()).resolves.toMatchObject({
+          document: {
+            id: document.id,
+            status: "uploaded",
+            currentStage: "enqueue_failed",
+          },
+          error: { code: "QUEUE_WRITE_FAILED" },
+        })
+
+        await runLocalDatabaseSql("select pgmq.create('document_ingestion');")
+
+        const retryResponse = await fetch(retryUrl, { method: "POST" })
+        expect(retryResponse.status).toBe(200)
+        await expect(retryResponse.json()).resolves.toMatchObject({
+          document: {
+            id: document.id,
+            status: "queued",
+            currentStage: "queue_pending",
+            errorCode: null,
+            errorSummary: null,
+          },
+        })
+
+        const replayResponse = await fetch(retryUrl, { method: "POST" })
+        expect(replayResponse.status).toBe(200)
+
+        const queuedPayloads = JSON.parse(
+          await runLocalDatabaseSql(
+            "select coalesce(jsonb_agg(message order by msg_id), '[]')::text " +
+              "from pgmq.read('document_ingestion', 30, 10);",
+          ),
+        ) as Array<Record<string, unknown>>
+        expect(queuedPayloads).toHaveLength(1)
+        expect(Object.keys(queuedPayloads[0]!).sort()).toEqual([
+          "contentSha256",
+          "documentId",
+          "idempotencyKey",
+          "ingestionVersion",
+        ])
+        expect(queuedPayloads[0]).toMatchObject({
+          documentId: document.id,
+          ingestionVersion: 1,
+          contentSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+          idempotencyKey: expect.any(String),
+        })
+        expect(queuedPayloads[0]!.idempotencyKey).toBe(
+          `${document.id}:1:${queuedPayloads[0]!.contentSha256}`,
+        )
+        expect(JSON.stringify(queuedPayloads)).not.toContain(
+          "只应留在私有 Storage。",
+        )
+        expect(JSON.stringify(queuedPayloads)).not.toContain(
+          "acceptance-test-secret",
+        )
+
+        const dataClient = createClient(
+          "http://127.0.0.1:54321",
+          localSupabaseServiceRoleKey,
+          { auth: { autoRefreshToken: false, persistSession: false } },
+        )
+        const { error: terminalStateError } = await dataClient
+          .from("documents")
+          .update({ status: "ready", current_stage: "completed" })
+          .eq("id", document.id)
+        if (terminalStateError) throw terminalStateError
+
+        const terminalRetry = await fetch(retryUrl, { method: "POST" })
+        expect(terminalRetry.status).toBe(409)
+        await expect(terminalRetry.json()).resolves.toMatchObject({
+          document: {
+            id: document.id,
+            status: "ready",
+            currentStage: "completed",
+          },
+          error: { code: "REQUEUE_NOT_ALLOWED" },
+        })
+
+        await fetch(`${baseUrl}/api/knowledge-bases/${knowledgeBaseId}`, {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirmation: "队列恢复验收" }),
+        })
+      })
+    } finally {
+      await runLocalDatabaseSql(
+        "select pgmq.drop_queue('document_ingestion'); " +
+          "select pgmq.create('document_ingestion');",
+      )
+    }
   })
 
   it(
@@ -473,13 +613,13 @@ describe("Zhi Flow Web 服务", () => {
               originalFilename: "manual.pdf",
               mimeType: "application/pdf",
               pageCount: 2,
-              status: "uploaded",
+              status: "queued",
             },
             {
               originalFilename: "notes.md",
               mimeType: "text/markdown",
               pageCount: null,
-              status: "uploaded",
+              status: "queued",
             },
           ],
         })
@@ -944,6 +1084,44 @@ async function expectUploadError(
   await expect(response.json()).resolves.toMatchObject({
     error: { code: expectedCode, message: expect.any(String) },
   })
+}
+
+async function runLocalDatabaseSql(sql: string): Promise<string> {
+  const database = spawn(
+    "docker",
+    [
+      "exec",
+      "supabase_db_zhi-flow",
+      "psql",
+      "-U",
+      "postgres",
+      "-d",
+      "postgres",
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-At",
+      "-c",
+      sql,
+    ],
+    { cwd: process.cwd(), stdio: "pipe" },
+  )
+  let stdout = ""
+  let stderr = ""
+  database.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString()
+  })
+  database.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString()
+  })
+
+  const code = await new Promise<number | null>((resolve, reject) => {
+    database.once("error", reject)
+    database.once("exit", resolve)
+  })
+  if (code !== 0) {
+    throw new Error(`本地数据库命令失败：${stderr.trim()}`)
+  }
+  return stdout.trim()
 }
 
 function filesForm(files: File[]): FormData {

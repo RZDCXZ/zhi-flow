@@ -6,6 +6,7 @@ import {
   LibraryIcon,
   PencilIcon,
   PlusIcon,
+  RefreshCwIcon,
   Trash2Icon,
   UploadIcon,
 } from "lucide-react"
@@ -222,12 +223,21 @@ export function KnowledgeBasePanel() {
         { method: "POST", body: form },
       )
       if (!response.ok) throw new Error(await readResponseError(response))
+      const body = (await response.json()) as { documents: Document[] }
       setUploadFeedback(
-        pendingFiles.map(({ name }) => ({
-          filename: name,
-          status: "uploaded",
-          message: "已安全保存",
-        })),
+        pendingFiles.map(({ name }) => {
+          const document = body.documents.find(
+            ({ originalFilename }) => originalFilename === name,
+          )
+          return {
+            filename: name,
+            status: "uploaded",
+            message:
+              document?.status === "queued"
+                ? "已安全保存并排队"
+                : (document?.errorSummary ?? "已安全保存，等待手动重新入队"),
+          }
+        }),
       )
       setPendingFiles([])
       await openKnowledgeBase(selectedKnowledgeBaseId)
@@ -241,6 +251,26 @@ export function KnowledgeBasePanel() {
         })),
       )
       setErrorMessage(message)
+    } finally {
+      setIsBusy(false)
+    }
+  }
+
+  async function retryDocumentEnqueue(documentId: string) {
+    if (!selectedKnowledgeBaseId) return
+    setIsBusy(true)
+    setErrorMessage(null)
+    try {
+      const response = await fetch(
+        `/api/knowledge-bases/${selectedKnowledgeBaseId}` +
+          `/documents/${documentId}/enqueue`,
+        { method: "POST" },
+      )
+      if (!response.ok) throw new Error(await readResponseError(response))
+      await openKnowledgeBase(selectedKnowledgeBaseId)
+    } catch (error) {
+      await openKnowledgeBase(selectedKnowledgeBaseId).catch(() => undefined)
+      setErrorMessage(readUnknownError(error))
     } finally {
       setIsBusy(false)
     }
@@ -378,7 +408,7 @@ export function KnowledgeBasePanel() {
                   className="flex items-start gap-3 rounded-xl border p-4"
                 >
                   <FileTextIcon className="mt-0.5 size-5 text-muted-foreground" />
-                  <div className="min-w-0">
+                  <div className="min-w-0 flex-1">
                     <p className="truncate font-medium">
                       {document.originalFilename}
                     </p>
@@ -393,6 +423,18 @@ export function KnowledgeBasePanel() {
                       </p>
                     ) : null}
                   </div>
+                  {document.status === "uploaded" &&
+                  document.currentStage === "enqueue_failed" ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={isBusy}
+                      onClick={() => retryDocumentEnqueue(document.id)}
+                    >
+                      <RefreshCwIcon data-icon="inline-start" />
+                      重新入队
+                    </Button>
+                  ) : null}
                 </article>
               ))
             )}
@@ -438,7 +480,10 @@ function clientPreflight(
 
 function documentStatusLabel(document: Document): string {
   const labels: Record<Document["status"], string> = {
-    uploaded: "已上传，等待用户决定是否进入摄取队列",
+    uploaded:
+      document.currentStage === "enqueue_failed"
+        ? "入队失败，可重试"
+        : "已上传，等待入队",
     queued: "已排队",
     processing: "处理中",
     ready: "已就绪",

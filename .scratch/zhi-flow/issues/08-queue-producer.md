@@ -1,7 +1,7 @@
 # 08 队列 Producer
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 07
 
 ## 学习目标
@@ -38,3 +38,5 @@ Blocked by: 07
 - Consumer、文件解析、重试消费和失败归档。
 
 ## Comments
+
+- 2026-07-23 完成 Supabase PGMQ Document 摄取队列、最小稳定任务负载、事务内幂等登记与 `queued` 状态切换；队列写失败保留已上传 Document 并提供手动重入队，公开 HTTP + 真实队列覆盖成功、失败恢复、重复请求、精简负载和终态保护。

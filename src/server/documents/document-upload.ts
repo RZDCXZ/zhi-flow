@@ -15,11 +15,8 @@ import type { Document } from "@/lib/knowledge-base-api"
 import { serverConfig } from "@/server/config"
 import { createServerDataClient } from "@/server/supabase"
 
-import {
-  documentColumns,
-  toDocument,
-  type DocumentRow,
-} from "./document-record"
+import { documentColumns, type DocumentRow } from "./document-record"
+import { enqueueDocumentIngestion } from "./document-ingestion-queue"
 
 const DOCUMENTS_BUCKET = "documents"
 
@@ -112,7 +109,12 @@ export async function uploadDocuments(
     )
   }
 
-  return createdRows.map(toDocument)
+  const documents: Document[] = []
+  for (const row of createdRows) {
+    const result = await enqueueDocumentIngestion(row.id)
+    documents.push(result.document)
+  }
+  return documents
 }
 
 async function inspectFile(
