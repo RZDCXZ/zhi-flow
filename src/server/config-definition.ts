@@ -2,6 +2,11 @@ import {
   DEFAULT_DOCUMENT_UPLOAD_LIMITS,
   type DocumentUploadLimits,
 } from "../lib/document-upload-policy"
+import {
+  DOCUMENT_INGESTION_CONSUMER_DEFAULTS,
+  DOCUMENT_INGESTION_PLACEHOLDER_MODES,
+  type DocumentIngestionPlaceholderMode,
+} from "../lib/document-ingestion-policy"
 
 const requiredVariables = [
   "ZHI_FLOW_CHAT_API_KEY",
@@ -27,6 +32,13 @@ export type ServerConfig = Readonly<{
   supabase: Readonly<{
     url: string
     secretKey: string
+  }>
+  consumer: Readonly<{
+    visibilityTimeoutSeconds: number
+    taskTimeoutMs: number
+    maxAttempts: number
+    pollIntervalMs: number
+    placeholderMode: DocumentIngestionPlaceholderMode
   }>
   upload: DocumentUploadLimits
 }>
@@ -90,6 +102,10 @@ export function loadServerConfig(
       url: supabaseUrl,
       secretKey: values.get("ZHI_FLOW_SUPABASE_SECRET_KEY")!,
     }),
+    consumer: Object.freeze({
+      ...DOCUMENT_INGESTION_CONSUMER_DEFAULTS,
+      placeholderMode: loadPlaceholderMode(environment),
+    }),
     upload: Object.freeze({
       maxFiles: loadPositiveInteger(
         environment,
@@ -113,6 +129,24 @@ export function loadServerConfig(
       ),
     }),
   })
+}
+
+function loadPlaceholderMode(
+  environment: NodeJS.ProcessEnv,
+): DocumentIngestionPlaceholderMode {
+  const value =
+    environment.ZHI_FLOW_CONSUMER_PLACEHOLDER_MODE?.trim() || "success"
+  if (
+    DOCUMENT_INGESTION_PLACEHOLDER_MODES.includes(
+      value as DocumentIngestionPlaceholderMode,
+    )
+  ) {
+    return value as DocumentIngestionPlaceholderMode
+  }
+  throw new Error(
+    "后端配置无效：ZHI_FLOW_CONSUMER_PLACEHOLDER_MODE 必须是 " +
+      DOCUMENT_INGESTION_PLACEHOLDER_MODES.join(", "),
+  )
 }
 
 function loadPositiveInteger(

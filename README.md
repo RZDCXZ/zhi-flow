@@ -1,6 +1,6 @@
 # Zhi Flow
 
-Zhi Flow 是一个按里程碑推进的单用户 AI 聊天与 RAG 学习项目。当前完成到里程碑 07：浏览器可以管理彼此隔离的通用 Conversation，也可以创建、重命名和确认删除 Knowledge Base，将 PDF、Markdown 与 TXT Document 安全上传到私有 Storage，并观察客户端预检、服务端权威校验和 `uploaded` 状态。每次聊天请求按顺序发送最近 12 条已完成 Message；失败、取消和未完成的助手正文不会进入 Provider 上下文。入队、解析、Chunk、Embedding、重生成、摘要与 RAG 尚未实现。
+Zhi Flow 是一个按里程碑推进的单用户 AI 聊天与 RAG 学习项目。当前完成到里程碑 09：浏览器可以管理彼此隔离的通用 Conversation，也可以创建、重命名和确认删除 Knowledge Base，将 PDF、Markdown 与 TXT Document 安全上传到私有 Storage，并通过持久队列交给独立 Consumer。Consumer 展示租约、任务时限、幂等认领、退避重试、崩溃恢复和失败归档；当前占位处理器只证明状态流转，真正解析、Chunk、Embedding、重生成、摘要与 RAG 尚未实现。
 
 ## 本地启动
 
@@ -64,6 +64,7 @@ curl http://localhost:3000/api/chat \
 - `ZHI_FLOW_DOCUMENT_MAX_FILE_BYTES`，默认 `20971520`（20 MiB）
 - `ZHI_FLOW_DOCUMENT_MAX_PDF_PAGES`，默认 `200`
 - `ZHI_FLOW_DOCUMENT_MAX_PARSED_CHARACTERS`，默认 `2000000`
+- `ZHI_FLOW_CONSUMER_PLACEHOLDER_MODE`，默认 `success`；仅用于本地故障实验
 - `ZHI_FLOW_SUPABASE_URL`，必须是 HTTP(S) URL
 - `ZHI_FLOW_SUPABASE_SECRET_KEY`，只能由服务端读取
 
@@ -77,6 +78,9 @@ npm run format:check  # 检查格式
 npm run lint          # ESLint 静态检查
 npm run typecheck     # TypeScript 类型检查
 npm test              # Provider 合约、聊天 HTTP 与启动行为测试
+npm run consumer      # 编译并处理至多一条 Document 摄取消息
+npm run consumer:once # 编译并处理至多一条 Document 摄取消息
+npm run consumer:start # 编译并持续运行本地 Document Consumer
 npm run db:test       # 数据库约束、删除语义、种子和权限集成测试
 npm run db:lint       # PostgreSQL 函数与迁移静态检查
 npm run build         # Next.js 生产构建
@@ -132,6 +136,30 @@ npm run db:stop  # 停止本项目的本地 Supabase 容器
 
 `supabase/seed.sql` 提供一组固定 UUID 的完整关系样例和全零 1024 维向量，只用于观察关系，不连接真实模型。`documents` Storage bucket 由迁移创建，限制为 20 MiB 的 PDF、Markdown 或 TXT，保持私有且不向客户端角色授予策略。
 
+## Document Consumer 与故障实验
+
+Document 上传成功后，Producer 只把 Document ID、摄取版本、内容哈希和幂等键写入 `document_ingestion`。Consumer 每次租约一条消息，默认 visibility timeout 为 15 分钟、任务总时限为 10 分钟、最多尝试 5 次；短暂错误使用指数退避和抖动，永久错误或耗尽重试会同时更新 Document、归档原消息并写入 `document_ingestion_failed`。
+
+处理一条消息或持续运行：
+
+```bash
+npm run consumer
+npm run consumer:once
+npm run consumer:start
+```
+
+在 `.env.local` 中临时设置 `ZHI_FLOW_CONSUMER_PLACEHOLDER_MODE` 可重复观察故障路径：
+
+| 值          | 占位行为                        | 预期 Document 状态                |
+| ----------- | ------------------------------- | --------------------------------- |
+| `success`   | 立即完成                        | `ready / placeholder_completed`   |
+| `transient` | 返回可重试错误                  | `queued / retry_wait`，最终失败   |
+| `permanent` | 返回不可重试错误                | `failed` 并进入失败队列           |
+| `timeout`   | 一直等待，直到 10 分钟任务时限  | 超时后退避重试                    |
+| `crash`     | 认领后以退出码 70 终止 Consumer | 15 分钟租约过期后由新进程重新领取 |
+
+可在本地数据库中观察 `documents.attempt_count/error_code/current_stage`、`pgmq.q_document_ingestion.vt/read_ct`、`pgmq.a_document_ingestion`、`public.document_ingestion_failures` 和 `pgmq.q_document_ingestion_failed`。同一 Document 版本只认 Producer 登记的活动消息 ID；每次重新认领还会生成唯一 claim ID，旧租约持有者不能提交完成、重试或失败终态。后续真实处理器写入 Chunk 等业务输出时，也必须在同一事务中校验该 claim ID。两个 Consumer 竞争时由 PGMQ 的租约锁保证只有一个领取者，重复 payload 会直接归档而不再次调用处理器。
+
 ## 运行边界
 
 - `src/components/chat-panel.tsx` 是 Client Component，消费公开 Conversation HTTP 与聊天 SSE 协议；数据库和服务端凭据不进入浏览器。
@@ -141,6 +169,8 @@ npm run db:stop  # 停止本项目的本地 Supabase 容器
 - `src/app/api/chat/route.ts` 是 Assistant Message 生成的 HTTP adapter，只处理传输解析、module 结果映射、SSE 协议元数据、framing 和注释心跳。
 - `src/server/knowledge-bases.ts` 负责 Knowledge Base 与 Document 列表持久化，并在确认删除后清理其私有 Storage 对象。
 - `src/server/documents/document-upload.ts` 负责扩展名、MIME、内容特征、大小、PDF 页数和解析字符数的权威校验，以及 Storage/Document 一致落地与失败清理。
+- `src/server/documents/document-ingestion-consumer.ts` 是 Consumer 高层接缝：领取一条租约消息、原子认领 Document 版本、执行可取消处理器，并裁决成功、重试、失败和重复交付。
+- `scripts/document-ingestion-consumer.ts` 是独立 Node.js 进程入口，支持单条处理、持续轮询、优雅停止和可控占位故障模式。
 - `src/server/conversations.ts` 只提供 Conversation CRUD 与纯历史读取，不拥有 Assistant Message 生成生命周期。
 - `src/server/chat/assistant-message-generation.ts` 是生成 deep module：读取同一 Conversation 最近已完成的 Message，通过 `create_message_submission` RPC 原子裁决创建、幂等和单活动生成，并拥有正文持久化、取消、恢复与终态竞争。
 - `src/server/chat/` 同时定义 Provider 合约、可控假 Provider 与 OpenAI-compatible 实现；供应商配置只从服务端配置进入真实实现。

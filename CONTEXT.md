@@ -31,3 +31,7 @@ _Avoid_: Library, corpus
 **Document**:
 用户上传到某个 Knowledge Base 的原始 PDF、Markdown 或 TXT 文件及其可追踪元数据。`uploaded` 表示文件已安全落入私有 Storage，但尚未进入摄取队列。
 _Avoid_: Knowledge Document, file record
+
+**Document Ingestion Claim**:
+Consumer 对一个 Document 摄取版本的一次有界处理权。每次认领生成新的 claim ID；只有最新 claim 能提交状态与有效输出，租约过期的旧 Consumer 会被 fencing。
+_Avoid_: Worker lock, processing session

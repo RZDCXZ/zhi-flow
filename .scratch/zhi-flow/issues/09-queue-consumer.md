@@ -1,7 +1,7 @@
 # 09 队列 Consumer
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 08
 
 ## 学习目标
@@ -37,4 +37,10 @@ Blocked by: 08
 
 - 真正解析、切块、Embedding、线上部署和吞吐优化。
 
+## Answer
+
+Consumer 以 PGMQ 单消息租约为入口，通过数据库原子函数认领 Document 当前摄取版本与唯一 claim generation；只有 Producer 登记的活动消息和最新 claim 能推进状态。成功会归档原消息并进入占位 `ready` 终态，短暂错误延后可见性，永久错误或第五次失败会原子写入 `document_ingestion_failed` 与失败登记。独立进程支持 `consumer:once`、`consumer:start` 和五种可控占位故障模式，后续里程碑可在同一处理器接缝替换真实解析逻辑。
+
 ## Comments
+
+- 2026-07-23 完成独立 Node.js Document Consumer：单条/持续运行入口、15 分钟租约、10 分钟任务时限、最多 5 次尝试、带抖动退避、失败队列和 Document 摄取版本/claim generation 幂等保护；真实队列与数据库测试覆盖成功、短暂/永久错误、超时、耗尽重试、连续崩溃、租约过期、旧 claim fencing、竞争、重复和无效消息。

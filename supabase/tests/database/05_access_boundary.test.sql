@@ -1,6 +1,6 @@
 begin;
 
-select plan(11);
+select plan(14);
 
 select ok(
   exists(select 1 from storage.buckets where id = 'documents'),
@@ -27,6 +27,7 @@ select is(
       'public.knowledge_bases'::regclass,
       'public.documents'::regclass,
       'public.document_ingestion_enqueues'::regclass,
+      'public.document_ingestion_failures'::regclass,
       'public.document_chunks'::regclass,
       'public.conversations'::regclass,
       'public.messages'::regclass,
@@ -35,7 +36,7 @@ select is(
     )
       and relrowsecurity
   ),
-  8,
+  9,
   'all application tables enable row-level security'
 );
 
@@ -95,6 +96,36 @@ select is(
   ),
   true,
   'the server service role can enqueue Documents'
+);
+
+select is(
+  has_table_privilege(
+    'anon',
+    'public.document_ingestion_failures',
+    'select'
+  ),
+  false,
+  'anonymous clients cannot read Document ingestion failures'
+);
+
+select is(
+  has_function_privilege(
+    'anon',
+    'public.lease_document_ingestion(integer)',
+    'execute'
+  ),
+  false,
+  'anonymous clients cannot lease Document ingestion messages'
+);
+
+select is(
+  has_function_privilege(
+    'service_role',
+    'public.lease_document_ingestion(integer)',
+    'execute'
+  ),
+  true,
+  'the server service role can lease Document ingestion messages'
 );
 
 select * from finish();

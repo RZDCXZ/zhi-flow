@@ -59,6 +59,28 @@ describe("服务端配置", () => {
     })
   })
 
+  it("统一提供 Document Consumer 默认值并校验占位模式", () => {
+    expect(loadServerConfig(validEnvironment).consumer).toEqual({
+      visibilityTimeoutSeconds: 15 * 60,
+      taskTimeoutMs: 10 * 60_000,
+      maxAttempts: 5,
+      pollIntervalMs: 1_000,
+      placeholderMode: "success",
+    })
+    expect(
+      loadServerConfig({
+        ...validEnvironment,
+        ZHI_FLOW_CONSUMER_PLACEHOLDER_MODE: "permanent",
+      }).consumer.placeholderMode,
+    ).toBe("permanent")
+    expect(() =>
+      loadServerConfig({
+        ...validEnvironment,
+        ZHI_FLOW_CONSUMER_PLACEHOLDER_MODE: "unknown",
+      }),
+    ).toThrowError(/ZHI_FLOW_CONSUMER_PLACEHOLDER_MODE/)
+  })
+
   it("提供可覆盖的 Document 上传限制，并拒绝非正整数", () => {
     expect(loadServerConfig(validEnvironment).upload).toEqual({
       maxFiles: 10,

@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowJs": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "noEmit": false,
+    "outDir": ".consumer-build",
+    "plugins": [],
+    "rootDir": ".",
+    "target": "ES2022",
+    "types": ["node"]
+  },
+  "include": [
+    "scripts/document-ingestion-consumer.ts",
+    "src/lib/document-ingestion-policy.ts",
+    "src/lib/document-upload-policy.ts",
+    "src/server/config-definition.ts",
+    "src/server/documents/document-ingestion-consumer.ts"
+  ]
+}

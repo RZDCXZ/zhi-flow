@@ -5,6 +5,7 @@
 /.next/
 /.next-acceptance-*
 /out/
+/.consumer-build/
 
 # testing
 /coverage/
