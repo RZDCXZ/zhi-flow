@@ -57,6 +57,8 @@ type GenerationConfig = Readonly<{
   maxStreamAttempts: number
   contentFlushIntervalMs?: number
   contentFlushMaxChars?: number
+  retryBackoffBaseMs?: number
+  retryBackoffMaxMs?: number
 }>
 
 export type GenerationClock = Readonly<{
@@ -66,6 +68,9 @@ export type GenerationClock = Readonly<{
 
 const DEFAULT_CONTENT_FLUSH_INTERVAL_MS = 500
 const DEFAULT_CONTENT_FLUSH_MAX_CHARS = 1_024
+const DEFAULT_RETRY_BACKOFF_BASE_MS = 250
+const DEFAULT_RETRY_BACKOFF_MAX_MS = 2_000
+const CANCEL_POLL_INTERVAL_MS = 500
 
 const systemClock: GenerationClock = {
   now: () => Date.now(),
@@ -172,6 +177,8 @@ export class AssistantMessageGenerationModule {
   private readonly activeGenerations = new Map<string, ActiveGeneration>()
   private readonly contentFlushIntervalMs: number
   private readonly contentFlushMaxChars: number
+  private readonly retryBackoffBaseMs: number
+  private readonly retryBackoffMaxMs: number
   private readonly clock: GenerationClock
 
   constructor(
@@ -184,6 +191,10 @@ export class AssistantMessageGenerationModule {
       config.contentFlushIntervalMs ?? DEFAULT_CONTENT_FLUSH_INTERVAL_MS
     this.contentFlushMaxChars =
       config.contentFlushMaxChars ?? DEFAULT_CONTENT_FLUSH_MAX_CHARS
+    this.retryBackoffBaseMs =
+      config.retryBackoffBaseMs ?? DEFAULT_RETRY_BACKOFF_BASE_MS
+    this.retryBackoffMaxMs =
+      config.retryBackoffMaxMs ?? DEFAULT_RETRY_BACKOFF_MAX_MS
   }
 
   async start(request: StartRequest): Promise<StartGenerationResult> {
@@ -341,6 +352,7 @@ export class AssistantMessageGenerationModule {
     conversationId: string,
   ): Promise<RecoverStaleGenerationsResult> {
     try {
+      // Wall-clock absolute time: GenerationClock may be relative in tests.
       const staleBefore = new Date(
         Date.now() - this.config.totalTimeoutMs,
       ).toISOString()
@@ -368,9 +380,9 @@ export class AssistantMessageGenerationModule {
     assistantMessageId: string
     hub: EventHub
   }>): Promise<void> {
-    const startedAt = performance.now()
+    const startedAt = this.clock.now()
     const totalTimeout = new AbortController()
-    const totalTimer = setTimeout(
+    const clearTotalTimer = this.clock.setTimeout(
       () => totalTimeout.abort(),
       this.config.totalTimeoutMs,
     )
@@ -428,7 +440,7 @@ export class AssistantMessageGenerationModule {
       // persistence unavailable → transport interruption, no synthetic terminal
     } finally {
       contentBuffer.dispose()
-      clearTimeout(totalTimer)
+      clearTotalTimer()
       hub.end()
       this.activeGenerations.delete(assistantMessageId)
     }
@@ -496,6 +508,8 @@ export class AssistantMessageGenerationModule {
       attempt <= this.config.maxStreamAttempts;
       attempt += 1
     ) {
+      if (totalTimeout.aborted) throw new ChatProviderError("timeout")
+
       const attemptTimeout = new AbortController()
       const signal = AbortSignal.any([
         cancellation,
@@ -504,7 +518,7 @@ export class AssistantMessageGenerationModule {
       ])
       let usage: ChatTokenUsage | null = null
       let receivedContent = false
-      let firstActivity = true
+      let awaitingFirstActivity = true
       const iterator = this.provider
         .stream({ messages, signal })
         [Symbol.asyncIterator]()
@@ -513,11 +527,12 @@ export class AssistantMessageGenerationModule {
         while (true) {
           const result = await nextWithTimeout(
             iterator,
-            firstActivity
+            awaitingFirstActivity
               ? this.config.firstByteTimeoutMs
               : this.config.idleTimeoutMs,
             attemptTimeout,
             assistantMessageId,
+            this.clock,
           )
           if (result === assistantCancelled) {
             await this.emitCancelledIfNeeded(
@@ -531,7 +546,7 @@ export class AssistantMessageGenerationModule {
             return
           }
           if (result.done) break
-          firstActivity = false
+          awaitingFirstActivity = false
 
           if (result.value.type === "content.delta") {
             if (!result.value.delta) continue
@@ -550,6 +565,7 @@ export class AssistantMessageGenerationModule {
           } else if (result.value.type === "usage.snapshot") {
             usage = result.value.usage
           }
+          // activity events only reset the idle timer via the next wait
         }
 
         if (!receivedContent || usage === null) {
@@ -565,7 +581,7 @@ export class AssistantMessageGenerationModule {
         if (completed === true) {
           emit({
             type: "message.completed",
-            latencyMs: Math.round(performance.now() - startedAt),
+            latencyMs: Math.max(0, Math.round(this.clock.now() - startedAt)),
           })
           return
         }
@@ -606,6 +622,26 @@ export class AssistantMessageGenerationModule {
           providerError.kind !== "invalid_response" &&
           attempt < this.config.maxStreamAttempts
         ) {
+          const delayMs = retryBackoffDelayMs(
+            attempt,
+            this.retryBackoffBaseMs,
+            this.retryBackoffMaxMs,
+          )
+          const backoff = await sleepForRetryBackoff(this.clock, delayMs, {
+            cancellation,
+            totalTimeout,
+            assistantMessageId,
+          })
+          if (backoff === "timeout") throw new ChatProviderError("timeout")
+          if (backoff === "cancelled") {
+            await this.emitCancelledIfNeeded(
+              assistantMessageId,
+              contentBuffer,
+              emit,
+            )
+            return
+          }
+          if (backoff === "terminal-taken") return
           continue
         }
         throw providerError
@@ -784,43 +820,72 @@ async function nextWithTimeout<T>(
   timeoutMs: number,
   timeoutController: AbortController,
   assistantMessageId: string,
+  clock: GenerationClock,
 ): Promise<
   IteratorResult<T> | typeof assistantCancelled | typeof assistantTerminalTaken
 > {
-  const deadline = performance.now() + timeoutMs
-  const next = iterator.next().then(
-    (result) => ({ ok: true as const, result }),
-    (error: unknown) => ({ ok: false as const, error }),
+  const deadline = clock.now() + timeoutMs
+  type Settled =
+    | { ok: true; result: IteratorResult<T> }
+    | { ok: false; error: unknown }
+  let settled: Settled | null = null
+  let notify: (() => void) | null = null
+  void iterator.next().then(
+    (result) => {
+      settled = { ok: true, result }
+      notify?.()
+    },
+    (error: unknown) => {
+      settled = { ok: false, error }
+      notify?.()
+    },
   )
+  // Let a synchronous generator throw / immediate yield settle before waiting.
+  await Promise.resolve()
 
   while (true) {
-    const remainingMs = deadline - performance.now()
+    if (settled !== null) {
+      return finalizeIteratorResult(
+        settled,
+        timeoutController,
+        assistantMessageId,
+      )
+    }
+
+    const remainingMs = deadline - clock.now()
     if (remainingMs <= 0) {
       timeoutController.abort()
       throw new ChatProviderError("timeout")
     }
 
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const poll = new Promise<null>((resolve) => {
-      timer = setTimeout(resolve, Math.min(500, remainingMs), null)
-    })
-    const raced = await Promise.race([next, poll])
-    clearTimeout(timer)
-
-    if (raced !== null) {
-      if (!raced.ok) {
-        const status = await readAssistantMessageStatus(assistantMessageId)
-        if (status === "cancelled") {
-          timeoutController.abort()
-          return assistantCancelled
-        }
-        if (status === "completed" || status === "failed") {
-          timeoutController.abort()
-          return assistantTerminalTaken
-        }
-        throw raced.error
+    let clearPoll: (() => void) | undefined
+    await new Promise<void>((resolve) => {
+      notify = () => {
+        resolve()
       }
-      return raced.result
+      if (settled !== null) {
+        resolve()
+        return
+      }
+      clearPoll = clock.setTimeout(
+        () => resolve(),
+        Math.min(CANCEL_POLL_INTERVAL_MS, remainingMs),
+      )
+    })
+    notify = null
+    clearPoll?.()
+
+    if (settled !== null) {
+      return finalizeIteratorResult(
+        settled,
+        timeoutController,
+        assistantMessageId,
+      )
+    }
+
+    if (deadline - clock.now() <= 0) {
+      timeoutController.abort()
+      throw new ChatProviderError("timeout")
     }
 
     const status = await readAssistantMessageStatus(assistantMessageId)
@@ -831,6 +896,28 @@ async function nextWithTimeout<T>(
   }
 }
 
+async function finalizeIteratorResult<T>(
+  settled:
+    | { ok: true; result: IteratorResult<T> }
+    | { ok: false; error: unknown },
+  timeoutController: AbortController,
+  assistantMessageId: string,
+): Promise<
+  IteratorResult<T> | typeof assistantCancelled | typeof assistantTerminalTaken
+> {
+  if (settled.ok) return settled.result
+  const status = await readAssistantMessageStatus(assistantMessageId)
+  if (status === "cancelled") {
+    timeoutController.abort()
+    return assistantCancelled
+  }
+  if (status === "completed" || status === "failed") {
+    timeoutController.abort()
+    return assistantTerminalTaken
+  }
+  throw settled.error
+}
+
 const assistantCancelled = Symbol("assistant-cancelled")
 const assistantTerminalTaken = Symbol("assistant-terminal-taken")
 
@@ -838,4 +925,95 @@ function normalizeProviderError(error: unknown): ChatProviderError {
   return error instanceof ChatProviderError
     ? error
     : new ChatProviderError("unavailable")
+}
+
+function retryBackoffDelayMs(
+  failedAttempt: number,
+  baseMs: number,
+  maxMs: number,
+): number {
+  if (baseMs <= 0 || maxMs <= 0) return 0
+  const shift = Math.min(failedAttempt - 1, 30)
+  const exponential = baseMs * 2 ** shift
+  return Math.min(exponential, maxMs)
+}
+
+type RetryBackoffOutcome =
+  | "elapsed"
+  | "cancelled"
+  | "timeout"
+  | "terminal-taken"
+
+async function sleepForRetryBackoff(
+  clock: GenerationClock,
+  ms: number,
+  options: Readonly<{
+    cancellation: AbortSignal
+    totalTimeout: AbortSignal
+    assistantMessageId: string
+  }>,
+): Promise<RetryBackoffOutcome> {
+  const interrupted = (): RetryBackoffOutcome | null => {
+    if (options.cancellation.aborted) return "cancelled"
+    if (options.totalTimeout.aborted) return "timeout"
+    return null
+  }
+
+  const early = interrupted()
+  if (early) return early
+  if (ms <= 0) return "elapsed"
+
+  const deadline = clock.now() + ms
+  while (true) {
+    const signalOutcome = interrupted()
+    if (signalOutcome) return signalOutcome
+
+    const status = await readAssistantMessageStatus(options.assistantMessageId)
+    if (status === "cancelled") return "cancelled"
+    if (status === "completed" || status === "failed") return "terminal-taken"
+
+    const remainingMs = deadline - clock.now()
+    if (remainingMs <= 0) return "elapsed"
+
+    const chunkOutcome = await sleepChunk(
+      clock,
+      Math.min(CANCEL_POLL_INTERVAL_MS, remainingMs),
+      options.cancellation,
+      options.totalTimeout,
+    )
+    if (chunkOutcome !== "elapsed") return chunkOutcome
+  }
+}
+
+function sleepChunk(
+  clock: GenerationClock,
+  ms: number,
+  cancellation: AbortSignal,
+  totalTimeout: AbortSignal,
+): Promise<RetryBackoffOutcome> {
+  if (ms <= 0) return Promise.resolve("elapsed")
+  if (cancellation.aborted) return Promise.resolve("cancelled")
+  if (totalTimeout.aborted) return Promise.resolve("timeout")
+
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (outcome: RetryBackoffOutcome) => {
+      if (settled) return
+      settled = true
+      clearTimer()
+      cancellation.removeEventListener("abort", onAbort)
+      totalTimeout.removeEventListener("abort", onAbort)
+      resolve(outcome)
+    }
+    const onAbort = () => {
+      if (cancellation.aborted) {
+        finish("cancelled")
+        return
+      }
+      finish("timeout")
+    }
+    const clearTimer = clock.setTimeout(() => finish("elapsed"), ms)
+    cancellation.addEventListener("abort", onAbort, { once: true })
+    totalTimeout.addEventListener("abort", onAbort, { once: true })
+  })
 }

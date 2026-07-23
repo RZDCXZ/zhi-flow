@@ -8,6 +8,7 @@ import {
   type AssistantMessageGenerationEvent,
   type GenerationClock,
 } from "../../src/server/chat/assistant-message-generation"
+import { ChatProviderError } from "../../src/server/chat/chat-provider"
 import { FakeChatProvider } from "../../src/server/chat/fake-chat-provider"
 import * as conversations from "../../src/server/conversations"
 
@@ -1262,6 +1263,542 @@ describe("Assistant Message 生成 module", () => {
       finishSpy.mockRestore()
     }
   })
+
+  it("首个正文前的限流会在同一 Assistant Message 上有限 retry 后成功", async () => {
+    const conversationId = await createConversation("限流后成功")
+    let attempts = 0
+    const provider = new FakeChatProvider(async function* () {
+      attempts += 1
+      if (attempts === 1) throw new ChatProviderError("rate_limit")
+      yield { type: "content.delta", delta: "限流后恢复" }
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+      }
+    })
+    const generation = createGeneration(provider, {
+      maxStreamAttempts: 3,
+      retryBackoffBaseMs: 0,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "限流可恢复",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const events = await collectEvents(started.events)
+    expect(provider.requests).toHaveLength(2)
+    expect(events.map((event) => event.type)).toEqual([
+      "message.created",
+      "content.delta",
+      "usage.snapshot",
+      "message.completed",
+    ])
+    const created = events[0]
+    expect(created?.type).toBe("message.created")
+    if (created?.type !== "message.created") return
+    await expectAssistantStatus(
+      created.assistantMessageId,
+      "completed",
+      "限流后恢复",
+    )
+  })
+
+  it("首个正文前的暂时不可用与未产生正文的中断可 retry，并保持同一 Assistant Message", async () => {
+    const conversationId = await createConversation("暂时故障 retry")
+    let attempts = 0
+    const provider = new FakeChatProvider(async function* () {
+      attempts += 1
+      if (attempts === 1) throw new ChatProviderError("unavailable")
+      if (attempts === 2) throw new ChatProviderError("interrupted")
+      yield { type: "content.delta", delta: "第三次成功" }
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
+    const generation = createGeneration(provider, {
+      maxStreamAttempts: 3,
+      retryBackoffBaseMs: 0,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "暂时故障",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const events = await collectEvents(started.events)
+    expect(provider.requests).toHaveLength(3)
+    const created = events[0]
+    expect(created?.type).toBe("message.created")
+    if (created?.type !== "message.created") return
+    expect(events.at(-1)?.type).toBe("message.completed")
+    await expectAssistantStatus(
+      created.assistantMessageId,
+      "completed",
+      "第三次成功",
+    )
+
+    const { count, error } = await dataClient
+      .from("messages")
+      .select("id", { count: "exact", head: true })
+      .eq("conversation_id", conversationId)
+      .eq("role", "assistant")
+    if (error) throw error
+    expect(count).toBe(1)
+  })
+
+  it("认证失败与无效响应不 retry，并映射为稳定脱敏错误码", async () => {
+    const conversationId = await createConversation("不可 retry 错误")
+    const authProvider = new FakeChatProvider(async function* () {
+      throw new ChatProviderError("authentication")
+    })
+    const authGeneration = createGeneration(authProvider, {
+      maxStreamAttempts: 3,
+      retryBackoffBaseMs: 0,
+    })
+    const authStarted = await authGeneration.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "认证失败",
+    })
+    expect(authStarted.type).toBe("started")
+    if (authStarted.type !== "started") return
+    const authEvents = await collectEvents(authStarted.events)
+    expect(authProvider.requests).toHaveLength(1)
+    expect(authEvents.map((event) => event.type)).toEqual([
+      "message.created",
+      "message.failed",
+    ])
+    expect(authEvents[1]).toEqual({
+      type: "message.failed",
+      error: {
+        code: "PROVIDER_AUTHENTICATION_FAILED",
+        message: "聊天服务配置异常，请稍后再试。",
+        retryable: false,
+      },
+    })
+
+    const invalidConversationId = await createConversation("无效响应")
+    const invalidProvider = new FakeChatProvider(async function* () {
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 },
+      }
+    })
+    const invalidGeneration = createGeneration(invalidProvider, {
+      maxStreamAttempts: 3,
+      retryBackoffBaseMs: 0,
+    })
+    const invalidStarted = await invalidGeneration.start({
+      conversationId: invalidConversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "无效响应",
+    })
+    expect(invalidStarted.type).toBe("started")
+    if (invalidStarted.type !== "started") return
+    const invalidEvents = await collectEvents(invalidStarted.events)
+    expect(invalidProvider.requests).toHaveLength(1)
+    expect(invalidEvents.at(-1)).toEqual({
+      type: "message.failed",
+      error: {
+        code: "PROVIDER_UNAVAILABLE",
+        message: "聊天服务暂时不可用，请稍后重试。",
+        retryable: true,
+      },
+    })
+  })
+
+  it("首个正文后的流中断不重新生成并持久化为 STREAM_INTERRUPTED", async () => {
+    const conversationId = await createConversation("正文后不 retry")
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: "已显示" }
+      throw new ChatProviderError("interrupted")
+    })
+    const generation = createGeneration(provider, {
+      maxStreamAttempts: 3,
+      retryBackoffBaseMs: 0,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "正文后中断",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const events = await collectEvents(started.events)
+    expect(provider.requests).toHaveLength(1)
+    expect(events.map((event) => event.type)).toEqual([
+      "message.created",
+      "content.delta",
+      "message.failed",
+    ])
+    expect(events[2]).toEqual({
+      type: "message.failed",
+      error: {
+        code: "STREAM_INTERRUPTED",
+        message: "回答传输中断，请重试。",
+        retryable: true,
+      },
+    })
+    const created = events[0]
+    expect(created?.type).toBe("message.created")
+    if (created?.type !== "message.created") return
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("status,content,error_code")
+      .eq("id", created.assistantMessageId)
+      .single()
+    if (error) throw error
+    expect(data).toEqual({
+      status: "failed",
+      content: "已显示",
+      error_code: "STREAM_INTERRUPTED",
+    })
+  })
+
+  it("达到最大尝试次数后失败且不再调用 Provider", async () => {
+    const conversationId = await createConversation("最大尝试次数")
+    const provider = new FakeChatProvider(async function* () {
+      throw new ChatProviderError("rate_limit")
+    })
+    const generation = createGeneration(provider, {
+      maxStreamAttempts: 3,
+      retryBackoffBaseMs: 0,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "持续限流",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const events = await collectEvents(started.events)
+    expect(provider.requests).toHaveLength(3)
+    expect(events.at(-1)).toEqual({
+      type: "message.failed",
+      error: {
+        code: "RATE_LIMITED",
+        message: "请求过于频繁，请稍后重试。",
+        retryable: true,
+      },
+    })
+    const created = events[0]
+    expect(created?.type).toBe("message.created")
+    if (created?.type !== "message.created") return
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("status,error_code")
+      .eq("id", created.assistantMessageId)
+      .single()
+    if (error) throw error
+    expect(data).toEqual({ status: "failed", error_code: "RATE_LIMITED" })
+  })
+
+  it("retry 使用有上限的退避并始终保留同一 Assistant Message 身份", async () => {
+    const conversationId = await createConversation("有上限退避")
+    let attempts = 0
+    const provider = new FakeChatProvider(async function* () {
+      attempts += 1
+      if (attempts < 3) throw new ChatProviderError("unavailable")
+      yield { type: "content.delta", delta: "退避后成功" }
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
+    const clock = new ControllableClock()
+    const generation = createGeneration(provider, {
+      clock,
+      maxStreamAttempts: 3,
+      totalTimeoutMs: 60_000,
+      retryBackoffBaseMs: 200,
+      retryBackoffMaxMs: 300,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "退避",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+    const eventsPromise = collectEvents(started.events)
+
+    await waitForProviderRequests(provider, 1)
+    // Wait until the first bounded backoff is scheduled (base 200ms).
+    await waitForClockDueAtMost(clock, 200)
+    expect(provider.requests).toHaveLength(1)
+
+    await clock.advance(199)
+    expect(provider.requests).toHaveLength(1)
+    await clock.advance(1)
+    await waitForProviderRequests(provider, 2)
+    expect(clock.now()).toBe(200)
+
+    // Second backoff is capped at 300ms → due at t=500.
+    await waitForClockDueAtMost(clock, 500)
+    await clock.advance(299)
+    expect(provider.requests).toHaveLength(2)
+    await clock.advance(1)
+    await waitForProviderRequests(provider, 3)
+    expect(clock.now()).toBe(500)
+
+    const events = await eventsPromise
+    const created = events[0]
+    expect(created?.type).toBe("message.created")
+    if (created?.type !== "message.created") return
+    expect(events.at(-1)?.type).toBe("message.completed")
+    await expectAssistantStatus(
+      created.assistantMessageId,
+      "completed",
+      "退避后成功",
+    )
+  })
+
+  it("退避等待期间会发现数据库取消且不再发起下一次 Provider 尝试", async () => {
+    const conversationId = await createConversation("退避中取消")
+    const provider = new FakeChatProvider(async function* () {
+      throw new ChatProviderError("rate_limit")
+    })
+    const clock = new ControllableClock()
+    const owner = createGeneration(provider, {
+      clock,
+      maxStreamAttempts: 3,
+      totalTimeoutMs: 60_000,
+      retryBackoffBaseMs: 1_000,
+      retryBackoffMaxMs: 1_000,
+    })
+    const peer = createGeneration(successfulProvider("不会被调用"))
+
+    const started = await owner.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "退避中停止",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+    const eventsPromise = collectEvents(started.events)
+
+    await waitForProviderRequests(provider, 1)
+    await waitForClockDueAtMost(clock, 1_000)
+    expect(provider.requests).toHaveLength(1)
+
+    const { data: assistant, error } = await dataClient
+      .from("messages")
+      .select("id")
+      .eq("conversation_id", conversationId)
+      .eq("role", "assistant")
+      .single()
+    if (error) throw error
+
+    await expect(peer.cancel(assistant.id)).resolves.toEqual({
+      type: "accepted",
+      status: "cancelled",
+    })
+
+    // Poll interval is 500ms; advance past one poll without completing backoff.
+    await clock.advance(500)
+    const events = await eventsPromise
+    expect(provider.requests).toHaveLength(1)
+    expect(events.at(-1)).toEqual({ type: "message.cancelled" })
+    await expectAssistantStatus(assistant.id, "cancelled", "")
+  })
+
+  it("首字节时限按每次 Provider 尝试计算，超时可在正文前 retry", async () => {
+    const conversationId = await createConversation("首字节时限")
+    let attempts = 0
+    const provider = new FakeChatProvider(async function* (request) {
+      attempts += 1
+      if (attempts === 1) {
+        await waitForAbort(request.signal)
+      }
+      yield { type: "content.delta", delta: "第二次首字节" }
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
+    const clock = new ControllableClock()
+    const generation = createGeneration(provider, {
+      clock,
+      firstByteTimeoutMs: 1_000,
+      idleTimeoutMs: 60_000,
+      totalTimeoutMs: 60_000,
+      maxStreamAttempts: 2,
+      retryBackoffBaseMs: 0,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "首字节",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+    const eventsPromise = collectEvents(started.events)
+
+    await waitForProviderRequests(provider, 1)
+    await waitForClockTimers(clock, 2)
+    await clock.advance(999)
+    expect(provider.requests).toHaveLength(1)
+    await clock.advance(1)
+    await waitForProviderRequests(provider, 2)
+
+    const events = await eventsPromise
+    expect(provider.requests).toHaveLength(2)
+    expect(events.map((event) => event.type)).toEqual([
+      "message.created",
+      "content.delta",
+      "usage.snapshot",
+      "message.completed",
+    ])
+  })
+
+  it("空闲时限由有效 Provider activity 重置，超时后不再 retry", async () => {
+    const conversationId = await createConversation("空闲时限")
+    let providerHung = false
+    const provider = new FakeChatProvider(async function* (request) {
+      yield { type: "activity" }
+      yield { type: "content.delta", delta: "第一块" }
+      yield { type: "activity" }
+      providerHung = true
+      await waitForAbort(request.signal)
+    })
+    const clock = new ControllableClock()
+    const generation = createGeneration(provider, {
+      clock,
+      firstByteTimeoutMs: 60_000,
+      idleTimeoutMs: 1_000,
+      totalTimeoutMs: 60_000,
+      maxStreamAttempts: 3,
+      retryBackoffBaseMs: 0,
+      contentFlushIntervalMs: 60_000,
+      contentFlushMaxChars: 10_000,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "空闲",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const iterator = started.events[Symbol.asyncIterator]()
+    const created = await iterator.next()
+    expect(created.value?.type).toBe("message.created")
+    if (created.value?.type !== "message.created") return
+    const delta = await iterator.next()
+    expect(delta.value).toEqual({ type: "content.delta", delta: "第一块" })
+
+    const hangDeadline = Date.now() + 5_000
+    while (Date.now() < hangDeadline) {
+      if (providerHung && clock.timerCount() >= 2) break
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    expect(providerHung).toBe(true)
+    expect(provider.requests).toHaveLength(1)
+
+    // Idle deadline is 1000ms from the last activity; advance past it in one step
+    // so cancel-poll + deadline checks both observe the elapsed idle window.
+    await clock.advance(1_000)
+
+    const rest: AssistantMessageGenerationEvent[] = []
+    while (true) {
+      const next = await iterator.next()
+      if (next.done) break
+      rest.push(next.value)
+    }
+    expect(provider.requests).toHaveLength(1)
+    expect(rest.at(-1)).toEqual({
+      type: "message.failed",
+      error: {
+        code: "PROVIDER_TIMEOUT",
+        message: "聊天服务响应超时，请重试。",
+        retryable: true,
+      },
+    })
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("status,content,error_code")
+      .eq("id", created.value.assistantMessageId)
+      .single()
+    if (error) throw error
+    expect(data).toEqual({
+      status: "failed",
+      content: "第一块",
+      error_code: "PROVIDER_TIMEOUT",
+    })
+  })
+
+  it("总时限覆盖 retry 与退避，超时后持久化为 PROVIDER_TIMEOUT", async () => {
+    const conversationId = await createConversation("总时限")
+    const provider = new FakeChatProvider(async function* () {
+      throw new ChatProviderError("rate_limit")
+    })
+    const clock = new ControllableClock()
+    const generation = createGeneration(provider, {
+      clock,
+      firstByteTimeoutMs: 60_000,
+      idleTimeoutMs: 60_000,
+      totalTimeoutMs: 1_000,
+      maxStreamAttempts: 5,
+      retryBackoffBaseMs: 400,
+      retryBackoffMaxMs: 400,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "总时限",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+    const eventsPromise = collectEvents(started.events)
+
+    await waitForProviderRequests(provider, 1)
+    await waitForClockDueAtMost(clock, 400)
+    await clock.advance(400)
+    await waitForProviderRequests(provider, 2)
+    await waitForClockDueAtMost(clock, 800)
+    await clock.advance(400)
+    await waitForProviderRequests(provider, 3)
+    // Total deadline is t=1000; remaining backoff would be another 400ms.
+    await clock.advance(200)
+
+    const events = await eventsPromise
+    expect(provider.requests.length).toBeGreaterThanOrEqual(2)
+    expect(provider.requests.length).toBeLessThanOrEqual(3)
+    expect(events.at(-1)).toEqual({
+      type: "message.failed",
+      error: {
+        code: "PROVIDER_TIMEOUT",
+        message: "聊天服务响应超时，请重试。",
+        retryable: true,
+      },
+    })
+    const created = events[0]
+    expect(created?.type).toBe("message.created")
+    if (created?.type !== "message.created") return
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("status,error_code")
+      .eq("id", created.assistantMessageId)
+      .single()
+    if (error) throw error
+    expect(data).toEqual({ status: "failed", error_code: "PROVIDER_TIMEOUT" })
+  })
 })
 
 function createGeneration(
@@ -1271,17 +1808,24 @@ function createGeneration(
     contentFlushIntervalMs?: number
     contentFlushMaxChars?: number
     totalTimeoutMs?: number
+    firstByteTimeoutMs?: number
+    idleTimeoutMs?: number
+    maxStreamAttempts?: number
+    retryBackoffBaseMs?: number
+    retryBackoffMaxMs?: number
   } = {},
 ) {
   return new AssistantMessageGenerationModule(
     provider,
     {
-      firstByteTimeoutMs: 1_000,
-      idleTimeoutMs: 1_000,
+      firstByteTimeoutMs: options.firstByteTimeoutMs ?? 1_000,
+      idleTimeoutMs: options.idleTimeoutMs ?? 1_000,
       totalTimeoutMs: options.totalTimeoutMs ?? 5_000,
-      maxStreamAttempts: 1,
+      maxStreamAttempts: options.maxStreamAttempts ?? 1,
       contentFlushIntervalMs: options.contentFlushIntervalMs,
       contentFlushMaxChars: options.contentFlushMaxChars,
+      retryBackoffBaseMs: options.retryBackoffBaseMs,
+      retryBackoffMaxMs: options.retryBackoffMaxMs,
     },
     options.clock,
   )
@@ -1297,6 +1841,18 @@ class ControllableClock implements GenerationClock {
 
   now(): number {
     return this.currentMs
+  }
+
+  timerCount(): number {
+    return this.timers.size
+  }
+
+  earliestDueMs(): number | null {
+    let earliest: number | null = null
+    for (const timer of this.timers.values()) {
+      if (earliest === null || timer.dueMs < earliest) earliest = timer.dueMs
+    }
+    return earliest
   }
 
   setTimeout(callback: () => void, ms: number): () => void {
@@ -1325,8 +1881,8 @@ class ControllableClock implements GenerationClock {
       this.timers.delete(nextId)
       this.currentMs = timer.dueMs
       timer.callback()
-      await Promise.resolve()
-      await Promise.resolve()
+      // Allow clock-driven timeout / backoff awaits to reschedule the next timer.
+      for (let i = 0; i < 50; i += 1) await Promise.resolve()
     }
     this.currentMs = target
   }
@@ -1465,6 +2021,31 @@ async function waitForProviderRequests(
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
   expect(provider.requests).toHaveLength(count)
+}
+
+async function waitForClockTimers(
+  clock: ControllableClock,
+  minimum: number,
+): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    if (clock.timerCount() >= minimum) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  expect(clock.timerCount()).toBeGreaterThanOrEqual(minimum)
+}
+
+async function waitForClockDueAtMost(
+  clock: ControllableClock,
+  dueMs: number,
+): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const earliest = clock.earliestDueMs()
+    if (earliest !== null && earliest <= dueMs) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  expect(clock.earliestDueMs()).toBeLessThanOrEqual(dueMs)
 }
 
 async function waitForAssistantStatus(
