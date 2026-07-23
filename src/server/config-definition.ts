@@ -1,3 +1,8 @@
+import {
+  DEFAULT_DOCUMENT_UPLOAD_LIMITS,
+  type DocumentUploadLimits,
+} from "../lib/document-upload-policy"
+
 const requiredVariables = [
   "ZHI_FLOW_CHAT_API_KEY",
   "ZHI_FLOW_CHAT_BASE_URL",
@@ -23,6 +28,7 @@ export type ServerConfig = Readonly<{
     url: string
     secretKey: string
   }>
+  upload: DocumentUploadLimits
 }>
 
 export function loadServerConfig(
@@ -83,6 +89,28 @@ export function loadServerConfig(
     supabase: Object.freeze({
       url: supabaseUrl,
       secretKey: values.get("ZHI_FLOW_SUPABASE_SECRET_KEY")!,
+    }),
+    upload: Object.freeze({
+      maxFiles: loadPositiveInteger(
+        environment,
+        "ZHI_FLOW_DOCUMENT_MAX_FILES",
+        DEFAULT_DOCUMENT_UPLOAD_LIMITS.maxFiles,
+      ),
+      maxFileBytes: loadPositiveInteger(
+        environment,
+        "ZHI_FLOW_DOCUMENT_MAX_FILE_BYTES",
+        DEFAULT_DOCUMENT_UPLOAD_LIMITS.maxFileBytes,
+      ),
+      maxPdfPages: loadPositiveInteger(
+        environment,
+        "ZHI_FLOW_DOCUMENT_MAX_PDF_PAGES",
+        DEFAULT_DOCUMENT_UPLOAD_LIMITS.maxPdfPages,
+      ),
+      maxParsedCharacters: loadPositiveInteger(
+        environment,
+        "ZHI_FLOW_DOCUMENT_MAX_PARSED_CHARACTERS",
+        DEFAULT_DOCUMENT_UPLOAD_LIMITS.maxParsedCharacters,
+      ),
     }),
   })
 }

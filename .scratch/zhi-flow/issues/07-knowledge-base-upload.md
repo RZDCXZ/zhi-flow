@@ -1,7 +1,7 @@
 # 07 知识库与文件上传
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 06
 
 ## 学习目标
@@ -38,3 +38,5 @@ Blocked by: 06
 - 入队、解析、Chunk、Embedding 和拖拽体验优化。
 
 ## Comments
+
+- 2026-07-23 完成 Knowledge Base 生命周期、私有 Storage 上传、`uploaded` Document、客户端预检与服务端权威校验矩阵；完整检查覆盖 HTTP、Storage/数据库一致性、级联删除与私有访问边界。

@@ -23,3 +23,11 @@ _Avoid_: Message Attempt, Response Attempt
 **Cancelled Assistant Message**:
 因用户显式停止而终止的 Assistant Message。网络断开或运行进程终止不属于取消。
 _Avoid_: Disconnected Message
+
+**Knowledge Base**:
+按主题隔离私人 Document 的容器。删除 Knowledge Base 会显式确认，并级联删除其 Document 与相关数据。
+_Avoid_: Library, corpus
+
+**Document**:
+用户上传到某个 Knowledge Base 的原始 PDF、Markdown 或 TXT 文件及其可追踪元数据。`uploaded` 表示文件已安全落入私有 Storage，但尚未进入摄取队列。
+_Avoid_: Knowledge Document, file record

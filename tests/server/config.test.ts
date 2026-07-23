@@ -59,6 +59,35 @@ describe("服务端配置", () => {
     })
   })
 
+  it("提供可覆盖的 Document 上传限制，并拒绝非正整数", () => {
+    expect(loadServerConfig(validEnvironment).upload).toEqual({
+      maxFiles: 10,
+      maxFileBytes: 20 * 1024 * 1024,
+      maxPdfPages: 200,
+      maxParsedCharacters: 2_000_000,
+    })
+    expect(
+      loadServerConfig({
+        ...validEnvironment,
+        ZHI_FLOW_DOCUMENT_MAX_FILES: "3",
+        ZHI_FLOW_DOCUMENT_MAX_FILE_BYTES: "4096",
+        ZHI_FLOW_DOCUMENT_MAX_PDF_PAGES: "12",
+        ZHI_FLOW_DOCUMENT_MAX_PARSED_CHARACTERS: "9000",
+      }).upload,
+    ).toEqual({
+      maxFiles: 3,
+      maxFileBytes: 4096,
+      maxPdfPages: 12,
+      maxParsedCharacters: 9000,
+    })
+    expect(() =>
+      loadServerConfig({
+        ...validEnvironment,
+        ZHI_FLOW_DOCUMENT_MAX_PDF_PAGES: "0",
+      }),
+    ).toThrowError(/ZHI_FLOW_DOCUMENT_MAX_PDF_PAGES/)
+  })
+
   it("缺失 Supabase 特权密钥时拒绝启动且不泄露其他密钥", () => {
     const environment = { ...validEnvironment }
     delete environment.ZHI_FLOW_SUPABASE_SECRET_KEY

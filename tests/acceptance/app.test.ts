@@ -33,16 +33,24 @@ describe("Zhi Flow Web 服务", () => {
     await withDevelopmentServer(async (baseUrl) => {
       const response = await fetch(baseUrl)
       const html = await response.text()
+      const visibleHtml = html.replaceAll("<!-- -->", "")
 
       expect(response.status).toBe(200)
       expect(html).toContain("Zhi Flow")
-      expect(html).toContain("观察多轮上下文增长")
+      expect(html).toContain("构建私有知识库摄取入口")
       expect(html).toContain("输入消息")
       expect(html).toContain("发送消息")
       expect(html).toContain("新建会话")
       expect(html).toContain("选择一个 Conversation")
       expect(html).toContain("最近 12 条已完成 Message")
       expect(html).toContain("输入 Token")
+      expect(html).toContain("Knowledge Bases")
+      expect(html).toContain("新建知识库")
+      expect(html).toContain("上传 Document")
+      expect(html).toContain("PDF、Markdown、TXT")
+      expect(visibleHtml).toContain("20 MiB")
+      expect(visibleHtml).toContain("200 页")
+      expect(visibleHtml).toContain("最多 10 个文件")
     })
   })
 
@@ -56,6 +64,53 @@ describe("Zhi Flow Web 服务", () => {
         service: "zhi-flow",
       })
     })
+  })
+
+  it("通过公开策略接口展示后端配置，并以同一限制权威校验上传", async () => {
+    await withDevelopmentServer(
+      async (baseUrl) => {
+        const policyResponse = await fetch(
+          `${baseUrl}/api/knowledge-bases/upload-policy`,
+        )
+        expect(policyResponse.status).toBe(200)
+        await expect(policyResponse.json()).resolves.toMatchObject({
+          policy: {
+            maxFiles: 2,
+            maxFileBytes: 3,
+            maxPdfPages: 7,
+            maxParsedCharacters: 99,
+            acceptedExtensions: [".pdf", ".md", ".markdown", ".txt"],
+          },
+        })
+
+        const created = (await (
+          await fetch(`${baseUrl}/api/knowledge-bases`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: "可配置上传限制" }),
+          })
+        ).json()) as { knowledgeBase: { id: string } }
+        await expectUploadError(
+          `${baseUrl}/api/knowledge-bases/${created.knowledgeBase.id}/documents`,
+          [new File(["four"], "four.txt", { type: "text/plain" })],
+          "FILE_TOO_LARGE",
+        )
+        await fetch(
+          `${baseUrl}/api/knowledge-bases/${created.knowledgeBase.id}`,
+          {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ confirmation: "可配置上传限制" }),
+          },
+        )
+      },
+      {
+        ZHI_FLOW_DOCUMENT_MAX_FILES: "2",
+        ZHI_FLOW_DOCUMENT_MAX_FILE_BYTES: "3",
+        ZHI_FLOW_DOCUMENT_MAX_PDF_PAGES: "7",
+        ZHI_FLOW_DOCUMENT_MAX_PARSED_CHARACTERS: "99",
+      },
+    )
   })
 
   it("通过公开 HTTP 接缝创建、列表、读取、重命名和删除 Conversation", async () => {
@@ -123,6 +178,332 @@ describe("Zhi Flow Web 服务", () => {
       ).toMatchObject({ status: 404 })
     })
   })
+
+  it("通过公开 HTTP 接缝创建、列表、读取、重命名和确认删除 Knowledge Base", async () => {
+    await withDevelopmentServer(async (baseUrl) => {
+      const createResponse = await fetch(`${baseUrl}/api/knowledge-bases`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "产品手册" }),
+      })
+      const created = (await createResponse.json()) as {
+        knowledgeBase: { id: string; name: string }
+      }
+
+      expect(createResponse.status).toBe(201)
+      expect(created.knowledgeBase).toMatchObject({
+        id: expect.any(String),
+        name: "产品手册",
+      })
+
+      const listResponse = await fetch(`${baseUrl}/api/knowledge-bases`)
+      const listed = (await listResponse.json()) as {
+        knowledgeBases: Array<{ id: string; name: string }>
+      }
+      expect(listResponse.status).toBe(200)
+      expect(listed.knowledgeBases).toContainEqual(
+        expect.objectContaining({
+          id: created.knowledgeBase.id,
+          name: "产品手册",
+        }),
+      )
+
+      const readResponse = await fetch(
+        `${baseUrl}/api/knowledge-bases/${created.knowledgeBase.id}`,
+      )
+      expect(readResponse.status).toBe(200)
+      await expect(readResponse.json()).resolves.toMatchObject({
+        knowledgeBase: { id: created.knowledgeBase.id },
+        documents: [],
+      })
+
+      const renameResponse = await fetch(
+        `${baseUrl}/api/knowledge-bases/${created.knowledgeBase.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: "已更新手册" }),
+        },
+      )
+      expect(renameResponse.status).toBe(200)
+      await expect(renameResponse.json()).resolves.toMatchObject({
+        knowledgeBase: {
+          id: created.knowledgeBase.id,
+          name: "已更新手册",
+        },
+      })
+
+      const unconfirmedDelete = await fetch(
+        `${baseUrl}/api/knowledge-bases/${created.knowledgeBase.id}`,
+        {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirmation: "产品手册" }),
+        },
+      )
+      expect(unconfirmedDelete.status).toBe(400)
+
+      const deleteResponse = await fetch(
+        `${baseUrl}/api/knowledge-bases/${created.knowledgeBase.id}`,
+        {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirmation: "已更新手册" }),
+        },
+      )
+      expect(deleteResponse.status).toBe(204)
+      expect(
+        await fetch(
+          `${baseUrl}/api/knowledge-bases/${created.knowledgeBase.id}`,
+        ),
+      ).toMatchObject({ status: 404 })
+    })
+  })
+
+  it("上传合法 TXT 至私有 Storage，创建 uploaded Document，并随 Knowledge Base 删除", async () => {
+    await withDevelopmentServer(async (baseUrl) => {
+      const created = (await (
+        await fetch(`${baseUrl}/api/knowledge-bases`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: "上传一致性验收" }),
+        })
+      ).json()) as { knowledgeBase: { id: string; name: string } }
+      const knowledgeBaseId = created.knowledgeBase.id
+      const form = new FormData()
+      form.append(
+        "files",
+        new File(["Zhi Flow 私有知识库内容。"], "guide.txt", {
+          type: "text/plain",
+        }),
+      )
+
+      const uploadResponse = await fetch(
+        `${baseUrl}/api/knowledge-bases/${knowledgeBaseId}/documents`,
+        { method: "POST", body: form },
+      )
+      const uploadBody = (await uploadResponse.json()) as {
+        documents: Array<{
+          id: string
+          originalFilename: string
+          status: string
+          currentStage: string
+        }>
+      }
+      expect(uploadResponse.status).toBe(201)
+      expect(uploadBody.documents).toEqual([
+        expect.objectContaining({
+          id: expect.any(String),
+          originalFilename: "guide.txt",
+          status: "uploaded",
+          currentStage: "stored",
+        }),
+      ])
+
+      const dataClient = createClient(
+        "http://127.0.0.1:54321",
+        localSupabaseServiceRoleKey,
+        { auth: { autoRefreshToken: false, persistSession: false } },
+      )
+      const { data: storedDocument, error: documentError } = await dataClient
+        .from("documents")
+        .select("id,storage_object_key,status")
+        .eq("id", uploadBody.documents[0]!.id)
+        .single()
+      if (documentError) throw documentError
+      expect(storedDocument.status).toBe("uploaded")
+
+      const download = await dataClient.storage
+        .from("documents")
+        .download(storedDocument.storage_object_key)
+      if (download.error) throw download.error
+      expect(await download.data.text()).toBe("Zhi Flow 私有知识库内容。")
+
+      const publicUrl = dataClient.storage
+        .from("documents")
+        .getPublicUrl(storedDocument.storage_object_key).data.publicUrl
+      expect((await fetch(publicUrl)).status).not.toBe(200)
+
+      const deleteResponse = await fetch(
+        `${baseUrl}/api/knowledge-bases/${knowledgeBaseId}`,
+        {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirmation: "上传一致性验收" }),
+        },
+      )
+      expect(deleteResponse.status).toBe(204)
+      const deletedDocument = await dataClient
+        .from("documents")
+        .select("id")
+        .eq("id", uploadBody.documents[0]!.id)
+        .maybeSingle()
+      expect(deletedDocument.error).toBeNull()
+      expect(deletedDocument.data).toBeNull()
+      const deletedObject = await dataClient.storage
+        .from("documents")
+        .download(storedDocument.storage_object_key)
+      expect(deletedObject.error).not.toBeNull()
+      expect(deletedObject.data).toBeNull()
+      const cleanupJobs = await dataClient
+        .from("storage_cleanup_jobs")
+        .select("id")
+        .eq("knowledge_base_id", knowledgeBaseId)
+      expect(cleanupJobs.error).toBeNull()
+      expect(cleanupJobs.data).toEqual([])
+    })
+  })
+
+  it(
+    "通过 HTTP 接缝权威校验文件格式、大小、PDF 与批次数量",
+    { timeout: 30_000 },
+    async () => {
+      await withDevelopmentServer(async (baseUrl) => {
+        const created = (await (
+          await fetch(`${baseUrl}/api/knowledge-bases`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: "上传校验矩阵" }),
+          })
+        ).json()) as { knowledgeBase: { id: string } }
+        const knowledgeBaseId = created.knowledgeBase.id
+        const uploadUrl = `${baseUrl}/api/knowledge-bases/${knowledgeBaseId}/documents`
+
+        await expectUploadError(uploadUrl, [], "INVALID_INPUT")
+        await expectUploadError(
+          uploadUrl,
+          [new File([], "empty.txt", { type: "text/plain" })],
+          "EMPTY_FILE",
+        )
+        await expectUploadError(
+          uploadUrl,
+          [new File(["not a pdf"], "forged.pdf", { type: "application/pdf" })],
+          "INVALID_FILE_TYPE",
+        )
+        await expectUploadError(
+          uploadUrl,
+          [new File(["plain text"], "forged.txt", { type: "application/pdf" })],
+          "INVALID_FILE_TYPE",
+        )
+        await expectUploadError(
+          uploadUrl,
+          [new File(["a,b"], "unsupported.csv", { type: "text/csv" })],
+          "INVALID_FILE_TYPE",
+        )
+        await expectUploadError(
+          uploadUrl,
+          [
+            new File([new Uint8Array([0xff, 0xfe, 0xfd])], "invalid.txt", {
+              type: "text/plain",
+            }),
+          ],
+          "INVALID_TEXT_ENCODING",
+        )
+        await expectUploadError(
+          uploadUrl,
+          [
+            new File(["x".repeat(2_000_001)], "too-many-characters.md", {
+              type: "text/markdown",
+            }),
+          ],
+          "PARSED_TEXT_TOO_LARGE",
+        )
+        await expectUploadError(
+          uploadUrl,
+          [
+            new File([new Uint8Array(20 * 1024 * 1024 + 1)], "too-large.txt", {
+              type: "text/plain",
+            }),
+          ],
+          "FILE_TOO_LARGE",
+        )
+        await expectUploadError(
+          uploadUrl,
+          Array.from(
+            { length: 11 },
+            (_, index) =>
+              new File(["ok"], `file-${index}.txt`, { type: "text/plain" }),
+          ),
+          "TOO_MANY_FILES",
+        )
+        await expectUploadError(
+          uploadUrl,
+          [
+            new File(["%PDF-1.7\nnot a valid PDF"], "damaged.pdf", {
+              type: "application/pdf",
+            }),
+          ],
+          "PDF_DAMAGED",
+        )
+        await expectUploadError(
+          uploadUrl,
+          [
+            new File([createTextPdf(1, "")], "scanned.pdf", {
+              type: "application/pdf",
+            }),
+          ],
+          "PDF_NO_TEXT",
+        )
+        await expectUploadError(
+          uploadUrl,
+          [
+            new File([createTextPdf(201, "page")], "too-many-pages.pdf", {
+              type: "application/pdf",
+            }),
+          ],
+          "PDF_TOO_MANY_PAGES",
+        )
+
+        const validForm = filesForm([
+          new File([createTextPdf(2, "searchable text")], "manual.pdf", {
+            type: "application/pdf",
+          }),
+          new File(["# Markdown\n可检索正文"], "notes.md", {
+            type: "text/markdown",
+          }),
+        ])
+        const validResponse = await fetch(uploadUrl, {
+          method: "POST",
+          body: validForm,
+        })
+        expect(validResponse.status).toBe(201)
+        await expect(validResponse.json()).resolves.toMatchObject({
+          documents: [
+            {
+              originalFilename: "manual.pdf",
+              mimeType: "application/pdf",
+              pageCount: 2,
+              status: "uploaded",
+            },
+            {
+              originalFilename: "notes.md",
+              mimeType: "text/markdown",
+              pageCount: null,
+              status: "uploaded",
+            },
+          ],
+        })
+
+        const dataClient = createClient(
+          "http://127.0.0.1:54321",
+          localSupabaseServiceRoleKey,
+          { auth: { autoRefreshToken: false, persistSession: false } },
+        )
+        const { count, error } = await dataClient
+          .from("documents")
+          .select("id", { count: "exact", head: true })
+          .eq("knowledge_base_id", knowledgeBaseId)
+        if (error) throw error
+        expect(count).toBe(2)
+
+        await fetch(`${baseUrl}/api/knowledge-bases/${knowledgeBaseId}`, {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirmation: "上传校验矩阵" }),
+        })
+      })
+    },
+  )
 
   it("按助手 Message 停止生成并持久化 cancelled 终态", async () => {
     let resolveProviderCancellation: (() => void) | undefined
@@ -548,6 +929,73 @@ async function withDevelopmentServer(
     currentTestConversationId = null
     await stopProcess(application)
   }
+}
+
+async function expectUploadError(
+  uploadUrl: string,
+  files: File[],
+  expectedCode: string,
+): Promise<void> {
+  const response = await fetch(uploadUrl, {
+    method: "POST",
+    body: filesForm(files),
+  })
+  expect(response.status).toBe(400)
+  await expect(response.json()).resolves.toMatchObject({
+    error: { code: expectedCode, message: expect.any(String) },
+  })
+}
+
+function filesForm(files: File[]): FormData {
+  const form = new FormData()
+  for (const file of files) form.append("files", file)
+  return form
+}
+
+function createTextPdf(pageCount: number, text: string): string {
+  const encoder = new TextEncoder()
+  const escapedText = text.replaceAll("\\", "\\\\").replaceAll("(", "\\(")
+  const objects: string[] = []
+  const pageObjectNumbers = Array.from(
+    { length: pageCount },
+    (_, index) => 3 + index * 2,
+  )
+  const fontObjectNumber = 3 + pageCount * 2
+
+  objects[1] = "<< /Type /Catalog /Pages 2 0 R >>"
+  objects[2] =
+    `<< /Type /Pages /Kids [${pageObjectNumbers.map((number) => `${number} 0 R`).join(" ")}] ` +
+    `/Count ${pageCount} >>`
+  for (let index = 0; index < pageCount; index += 1) {
+    const pageObjectNumber = pageObjectNumbers[index]!
+    const contentObjectNumber = pageObjectNumber + 1
+    const stream = `BT /F1 12 Tf 72 72 Td (${escapedText}) Tj ET`
+    objects[pageObjectNumber] =
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] ` +
+      `/Resources << /Font << /F1 ${fontObjectNumber} 0 R >> >> ` +
+      `/Contents ${contentObjectNumber} 0 R >>`
+    objects[contentObjectNumber] =
+      `<< /Length ${encoder.encode(stream).length} >>\nstream\n${stream}\nendstream`
+  }
+  objects[fontObjectNumber] =
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+
+  let pdf = "%PDF-1.4\n"
+  const offsets = [0]
+  for (let objectNumber = 1; objectNumber < objects.length; objectNumber += 1) {
+    offsets[objectNumber] = encoder.encode(pdf).length
+    pdf += `${objectNumber} 0 obj\n${objects[objectNumber]}\nendobj\n`
+  }
+  const xrefOffset = encoder.encode(pdf).length
+  pdf += `xref\n0 ${objects.length}\n`
+  pdf += "0000000000 65535 f \n"
+  for (let objectNumber = 1; objectNumber < objects.length; objectNumber += 1) {
+    pdf += `${String(offsets[objectNumber]).padStart(10, "0")} 00000 n \n`
+  }
+  pdf +=
+    `trailer\n<< /Size ${objects.length} /Root 1 0 R >>\n` +
+    `startxref\n${xrefOffset}\n%%EOF\n`
+  return pdf
 }
 
 async function withBareDevelopmentServer<T>(

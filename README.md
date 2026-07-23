@@ -1,6 +1,6 @@
 # Zhi Flow
 
-Zhi Flow 是一个按里程碑推进的单用户 AI 聊天与 RAG 学习项目。当前完成到里程碑 06：浏览器可以管理彼此隔离的通用 Conversation，通过版本化 SSE 观察多轮回答与 Token 用量，并在刷新后续聊。每次请求按顺序发送最近 12 条已完成 Message；失败、取消和未完成的助手正文不会进入 Provider 上下文。重生成、摘要、RAG 与供应商切换 UI 尚未实现。
+Zhi Flow 是一个按里程碑推进的单用户 AI 聊天与 RAG 学习项目。当前完成到里程碑 07：浏览器可以管理彼此隔离的通用 Conversation，也可以创建、重命名和确认删除 Knowledge Base，将 PDF、Markdown 与 TXT Document 安全上传到私有 Storage，并观察客户端预检、服务端权威校验和 `uploaded` 状态。每次聊天请求按顺序发送最近 12 条已完成 Message；失败、取消和未完成的助手正文不会进入 Provider 上下文。入队、解析、Chunk、Embedding、重生成、摘要与 RAG 尚未实现。
 
 ## 本地启动
 
@@ -60,6 +60,10 @@ curl http://localhost:3000/api/chat \
 - `ZHI_FLOW_CHAT_TOTAL_TIMEOUT_MS`，默认 `120000`
 - `ZHI_FLOW_CHAT_HEARTBEAT_INTERVAL_MS`，默认 `10000`
 - `ZHI_FLOW_CHAT_MAX_STREAM_ATTEMPTS`，默认 `3`
+- `ZHI_FLOW_DOCUMENT_MAX_FILES`，默认 `10`
+- `ZHI_FLOW_DOCUMENT_MAX_FILE_BYTES`，默认 `20971520`（20 MiB）
+- `ZHI_FLOW_DOCUMENT_MAX_PDF_PAGES`，默认 `200`
+- `ZHI_FLOW_DOCUMENT_MAX_PARSED_CHARACTERS`，默认 `2000000`
 - `ZHI_FLOW_SUPABASE_URL`，必须是 HTTP(S) URL
 - `ZHI_FLOW_SUPABASE_SECRET_KEY`，只能由服务端读取
 
@@ -124,7 +128,7 @@ npm run db:reset # 恢复可观察的最小种子数据
 npm run db:stop  # 停止本项目的本地 Supabase 容器
 ```
 
-核心关系是：Knowledge Base 级联拥有 Document，Document 级联拥有 Document Chunk；Conversation 拥有 Message；RAG Run 将同一 Conversation 的用户 Message 与助手 Message 配对；Citation 同时绑定 RAG Run、助手 Message 和同一 Knowledge Base 的真实 Document Chunk。删除 Document 会同步移除 Chunk、向量和 Citation，但保留 RAG Run 调试记录；删除用户 Message 会级联其助手尝试与 RAG Run；确认删除 Knowledge Base 后，其 Document、Chunk、绑定的 Conversation、Message、RAG Run 和 Citation 会一并删除。
+核心关系是：Knowledge Base 级联拥有 Document，Document 级联拥有 Document Chunk；Conversation 拥有 Message；RAG Run 将同一 Conversation 的用户 Message 与助手 Message 配对；Citation 同时绑定 RAG Run、助手 Message 和同一 Knowledge Base 的真实 Document Chunk。删除 Document 会同步移除 Chunk、向量和 Citation，但保留 RAG Run 调试记录；删除用户 Message 会级联其助手尝试与 RAG Run；确认删除 Knowledge Base 后，其 Document、Chunk、绑定的 Conversation、Message、RAG Run 和 Citation 会一并删除。删除前会持久化私有对象清理作业；若 Storage 暂时失败，对象键仍可追踪，并在后续读取或删除 Knowledge Base 时重试。
 
 `supabase/seed.sql` 提供一组固定 UUID 的完整关系样例和全零 1024 维向量，只用于观察关系，不连接真实模型。`documents` Storage bucket 由迁移创建，限制为 20 MiB 的 PDF、Markdown 或 TXT，保持私有且不向客户端角色授予策略。
 
@@ -133,7 +137,10 @@ npm run db:stop  # 停止本项目的本地 Supabase 容器
 - `src/components/chat-panel.tsx` 是 Client Component，消费公开 Conversation HTTP 与聊天 SSE 协议；数据库和服务端凭据不进入浏览器。
 - `src/app/api/health/route.ts` 是服务端 Route Handler，通过 HTTP 返回最小健康状态。
 - `src/app/api/conversations/` 提供 Conversation 创建、列表、读取历史、重命名和删除。
+- `src/app/api/knowledge-bases/` 提供 Knowledge Base 生命周期、后端上传策略和 Document 上传 HTTP 接缝。
 - `src/app/api/chat/route.ts` 是 Assistant Message 生成的 HTTP adapter，只处理传输解析、module 结果映射、SSE 协议元数据、framing 和注释心跳。
+- `src/server/knowledge-bases.ts` 负责 Knowledge Base 与 Document 列表持久化，并在确认删除后清理其私有 Storage 对象。
+- `src/server/documents/document-upload.ts` 负责扩展名、MIME、内容特征、大小、PDF 页数和解析字符数的权威校验，以及 Storage/Document 一致落地与失败清理。
 - `src/server/conversations.ts` 只提供 Conversation CRUD 与纯历史读取，不拥有 Assistant Message 生成生命周期。
 - `src/server/chat/assistant-message-generation.ts` 是生成 deep module：读取同一 Conversation 最近已完成的 Message，通过 `create_message_submission` RPC 原子裁决创建、幂等和单活动生成，并拥有正文持久化、取消、恢复与终态竞争。
 - `src/server/chat/` 同时定义 Provider 合约、可控假 Provider 与 OpenAI-compatible 实现；供应商配置只从服务端配置进入真实实现。
