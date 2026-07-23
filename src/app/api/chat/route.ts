@@ -25,8 +25,9 @@ export async function POST(request: Request) {
 
   const requestId = body.requestId ?? crypto.randomUUID()
   const result = await assistantMessageGeneration.start({
-    ...body,
-    requestId,
+    conversationId: body.conversationId,
+    clientIdempotencyKey: body.clientIdempotencyKey,
+    message: body.message,
   })
   if (result.type !== "started") {
     return chatError(

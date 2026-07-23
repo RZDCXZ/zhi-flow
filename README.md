@@ -133,9 +133,10 @@ npm run db:stop  # 停止本项目的本地 Supabase 容器
 - `src/components/chat-panel.tsx` 是 Client Component，消费公开 Conversation HTTP 与聊天 SSE 协议；数据库和服务端凭据不进入浏览器。
 - `src/app/api/health/route.ts` 是服务端 Route Handler，通过 HTTP 返回最小健康状态。
 - `src/app/api/conversations/` 提供 Conversation 创建、列表、读取历史、重命名和删除。
-- `src/app/api/chat/route.ts` 只接受通用 Conversation，在流开始前组装多轮上下文并创建 Message 对，边流边持久化正文，最后写入完成、取消或失败终态。
-- `src/server/conversations.ts` 集中 Conversation/Message 的数据库操作；上下文查询只取同一 Conversation 的最近已完成 Message，`create_message_submission` RPC 按 Conversation 原子裁决创建、幂等重放、键复用冲突和单活动生成冲突。
-- `src/server/chat/` 定义 Provider 合约、可控假 Provider 与 OpenAI-compatible 实现；供应商配置只从服务端配置进入真实实现。
+- `src/app/api/chat/route.ts` 是 Assistant Message 生成的 HTTP adapter，只处理传输解析、module 结果映射、SSE 协议元数据、framing 和注释心跳。
+- `src/server/conversations.ts` 只提供 Conversation CRUD 与纯历史读取，不拥有 Assistant Message 生成生命周期。
+- `src/server/chat/assistant-message-generation.ts` 是生成 deep module：读取同一 Conversation 最近已完成的 Message，通过 `create_message_submission` RPC 原子裁决创建、幂等和单活动生成，并拥有正文持久化、取消、恢复与终态竞争。
+- `src/server/chat/` 同时定义 Provider 合约、可控假 Provider 与 OpenAI-compatible 实现；供应商配置只从服务端配置进入真实实现。
 - `src/server/config-definition.ts` 是唯一配置定义与校验入口；`next.config.ts` 在启动阶段调用它，`src/server/config.ts` 为后续服务端业务提供只读配置。
 - `src/server/supabase.ts` 是服务端特权数据客户端入口；禁用会话持久化，不提供浏览器端 Supabase 客户端。
 - `.env.local`、`src/server/` 和模型配置不会成为客户端 API；前端只消费稳定的产品概念与 HTTP 协议。

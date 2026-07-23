@@ -10,7 +10,6 @@ import {
 } from "../../src/server/chat/assistant-message-generation"
 import { ChatProviderError } from "../../src/server/chat/chat-provider"
 import { FakeChatProvider } from "../../src/server/chat/fake-chat-provider"
-import * as conversations from "../../src/server/conversations"
 
 const supabaseUrl = "http://127.0.0.1:54321"
 const localServiceRoleKey =
@@ -1215,53 +1214,60 @@ describe("Assistant Message 生成 module", () => {
     })
   })
 
-  it("终态提交不可用时以 transport interruption 结束，不产生伪 message.failed", async () => {
-    const conversationId = await createConversation("持久化不可用")
-    const provider = successfulProvider("无法落库的正文")
-    const finishSpy = vi
-      .spyOn(conversations, "finishAssistantMessage")
-      .mockRejectedValue(new Error("database unavailable"))
+  it("数据库无法证明最终正文时以 transport interruption 结束且不产生伪终态", async () => {
+    const conversationId = await createConversation("最终正文无法落库")
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: "无法证明的正文" }
+      await allowCompletion
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+      }
+    })
     const generation = createGeneration(provider, {
       contentFlushIntervalMs: 60_000,
       contentFlushMaxChars: 10_000,
     })
 
-    try {
-      const started = await generation.start({
-        conversationId,
-        clientIdempotencyKey: crypto.randomUUID(),
-        message: "终态写失败",
-      })
-      expect(started.type).toBe("started")
-      if (started.type !== "started") return
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "终态必须由数据库证明",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
 
-      const events = await collectEvents(started.events)
-      expect(events.map((event) => event.type)).toEqual([
-        "message.created",
-        "content.delta",
-        "usage.snapshot",
-      ])
-      expect(events.some((event) => event.type === "message.failed")).toBe(
-        false,
-      )
-      expect(events.some((event) => event.type === "message.completed")).toBe(
-        false,
-      )
-      expect(events.some((event) => event.type === "message.cancelled")).toBe(
-        false,
-      )
+    const stream = await takeUntilContentDelta(started.events)
+    const { data: deleted, error } = await dataClient
+      .from("messages")
+      .delete()
+      .eq("id", stream.assistantMessageId)
+      .select("id")
+      .single()
+    if (error) throw error
+    expect(deleted.id).toBe(stream.assistantMessageId)
+    releaseCompletion()
 
-      const created = events[0]
-      expect(created?.type).toBe("message.created")
-      if (created?.type !== "message.created") return
-      await expectAssistantStatus(
-        created.assistantMessageId,
-        "streaming",
-        "无法落库的正文",
-      )
-    } finally {
-      finishSpy.mockRestore()
-    }
+    const events = await collectEvents(stream.rest)
+    expect(events).toEqual([
+      { type: "content.delta", delta: "无法证明的正文" },
+      {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+      },
+    ])
+    expect(
+      events.some(
+        (event) =>
+          event.type === "message.completed" ||
+          event.type === "message.failed" ||
+          event.type === "message.cancelled",
+      ),
+    ).toBe(false)
   })
 
   it("首个正文前的限流会在同一 Assistant Message 上有限 retry 后成功", async () => {
