@@ -18,6 +18,8 @@
     "src/lib/document-ingestion-policy.ts",
     "src/lib/document-upload-policy.ts",
     "src/server/config-definition.ts",
-    "src/server/documents/document-ingestion-consumer.ts"
+    "src/server/documents/document-ingestion-consumer.ts",
+    "src/server/documents/document-parser.ts",
+    "src/pdfjs-worker.d.ts"
   ]
 }

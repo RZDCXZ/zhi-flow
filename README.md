@@ -148,17 +148,34 @@ npm run consumer:once
 npm run consumer:start
 ```
 
-在 `.env.local` 中临时设置 `ZHI_FLOW_CONSUMER_PLACEHOLDER_MODE` 可重复观察故障路径：
+`success` 会运行真实 PDF、Markdown、TXT 解析器；在 `.env.local` 中临时设置
+`ZHI_FLOW_CONSUMER_PLACEHOLDER_MODE` 可在解析前重复观察故障路径：
 
-| 值          | 占位行为                        | 预期 Document 状态                |
+| 值          | 行为                            | 预期 Document 状态                |
 | ----------- | ------------------------------- | --------------------------------- |
-| `success`   | 立即完成                        | `ready / placeholder_completed`   |
-| `transient` | 返回可重试错误                  | `queued / retry_wait`，最终失败   |
-| `permanent` | 返回不可重试错误                | `failed` 并进入失败队列           |
+| `success`   | 从私有 Storage 读取并解析原文   | `ready / parsing_completed`       |
+| `transient` | 解析前返回可重试错误            | `queued / retry_wait`，最终失败   |
+| `permanent` | 解析前返回不可重试错误          | `failed` 并进入失败队列           |
 | `timeout`   | 一直等待，直到 10 分钟任务时限  | 超时后退避重试                    |
 | `crash`     | 认领后以退出码 70 终止 Consumer | 15 分钟租约过期后由新进程重新领取 |
 
-可在本地数据库中观察 `documents.attempt_count/error_code/current_stage`、`pgmq.q_document_ingestion.vt/read_ct`、`pgmq.a_document_ingestion`、`public.document_ingestion_failures` 和 `pgmq.q_document_ingestion_failed`。同一 Document 版本只认 Producer 登记的活动消息 ID；每次重新认领还会生成唯一 claim ID，旧租约持有者不能提交完成、重试或失败终态。后续真实处理器写入 Chunk 等业务输出时，也必须在同一事务中校验该 claim ID。两个 Consumer 竞争时由 PGMQ 的租约锁保证只有一个领取者，重复 payload 会直接归档而不再次调用处理器。
+可在本地数据库中观察 `documents.attempt_count/error_code/current_stage`、`pgmq.q_document_ingestion.vt/read_ct`、`pgmq.a_document_ingestion`、`public.document_ingestion_failures` 和 `pgmq.q_document_ingestion_failed`。同一 Document 版本只认 Producer 登记的活动消息 ID；每次重新认领还会生成唯一 claim ID，旧租约持有者不能提交完成、重试或失败终态。解析器以同一 claim ID 原子替换 `document_paragraphs`，因此失败或旧租约不会留下部分有效输出。两个 Consumer 竞争时由 PGMQ 的租约锁保证只有一个领取者，重复 payload 会直接归档而不再次调用处理器。
+
+解析预览按 Document ID 查询；`source_locator` 标明 TXT/Markdown 的原文字符范围，或 PDF 的页码与页内字符范围：
+
+```sql
+select
+  paragraph_index,
+  kind,
+  page_number,
+  heading_level,
+  heading_path,
+  content,
+  source_locator
+from public.document_paragraphs
+where document_id = '<document-id>'
+order by paragraph_index;
+```
 
 ## 运行边界
 
@@ -170,7 +187,8 @@ npm run consumer:start
 - `src/server/knowledge-bases.ts` 负责 Knowledge Base 与 Document 列表持久化，并在确认删除后清理其私有 Storage 对象。
 - `src/server/documents/document-upload.ts` 负责扩展名、MIME、内容特征、大小、PDF 页数和解析字符数的权威校验，以及 Storage/Document 一致落地与失败清理。
 - `src/server/documents/document-ingestion-consumer.ts` 是 Consumer 高层接缝：领取一条租约消息、原子认领 Document 版本、执行可取消处理器，并裁决成功、重试、失败和重复交付。
-- `scripts/document-ingestion-consumer.ts` 是独立 Node.js 进程入口，支持单条处理、持续轮询、优雅停止和可控占位故障模式。
+- `src/server/documents/document-parser.ts` 从私有 Storage 读取原始 Document，解析 PDF、Markdown 与 TXT，并原子保存有页码、标题路径和原文范围的结构化段落。
+- `scripts/document-ingestion-consumer.ts` 是独立 Node.js 进程入口，支持单条处理、持续轮询、优雅停止和解析前可控故障模式。
 - `src/server/conversations.ts` 只提供 Conversation CRUD 与纯历史读取，不拥有 Assistant Message 生成生命周期。
 - `src/server/chat/assistant-message-generation.ts` 是生成 deep module：读取同一 Conversation 最近已完成的 Message，通过 `create_message_submission` RPC 原子裁决创建、幂等和单活动生成，并拥有正文持久化、取消、恢复与终态竞争。
 - `src/server/chat/` 同时定义 Provider 合约、可控假 Provider 与 OpenAI-compatible 实现；供应商配置只从服务端配置进入真实实现。

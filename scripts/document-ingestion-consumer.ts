@@ -6,13 +6,18 @@ import {
   type DocumentIngestionHandler,
   type DocumentIngestionResult,
 } from "../src/server/documents/document-ingestion-consumer"
+import { createDocumentParsingHandler } from "../src/server/documents/document-parser"
 
 const config = loadServerConfig()
-const placeholderMode = config.consumer.placeholderMode
+const parsingHandler = createDocumentParsingHandler({
+  supabaseUrl: config.supabase.url,
+  secretKey: config.supabase.secretKey,
+  limits: config.upload,
+})
 const consumer = createDocumentIngestionConsumer({
   supabaseUrl: config.supabase.url,
   secretKey: config.supabase.secretKey,
-  handler: createPlaceholderHandler(placeholderMode),
+  handler: withFaultInjection(parsingHandler, config.consumer.placeholderMode),
   visibilityTimeoutSeconds: config.consumer.visibilityTimeoutSeconds,
   taskTimeoutMs: config.consumer.taskTimeoutMs,
   maxAttempts: config.consumer.maxAttempts,
@@ -36,7 +41,7 @@ async function main(): Promise<void> {
   process.once("SIGINT", () => shutdown.abort())
   process.once("SIGTERM", () => shutdown.abort())
   console.log("Document ingestion Consumer started", {
-    placeholderMode,
+    faultMode: config.consumer.placeholderMode,
     visibilityTimeoutSeconds: config.consumer.visibilityTimeoutSeconds,
     taskTimeoutSeconds: config.consumer.taskTimeoutMs / 1_000,
     maxAttempts: config.consumer.maxAttempts,
@@ -45,19 +50,13 @@ async function main(): Promise<void> {
   console.log("Document ingestion Consumer stopped")
 }
 
-function createPlaceholderHandler(
+function withFaultInjection(
+  handler: DocumentIngestionHandler,
   mode: DocumentIngestionPlaceholderMode,
 ): DocumentIngestionHandler {
+  if (mode === "success") return handler
   return async (job, context) => {
-    console.log("Document ingestion message processing started", {
-      documentId: job.documentId,
-      ingestionVersion: job.ingestionVersion,
-      claimId: context.claimId,
-      placeholderMode: mode,
-    })
     switch (mode) {
-      case "success":
-        return
       case "transient":
         throw new DocumentIngestionError(
           "PLACEHOLDER_TRANSIENT",
@@ -76,6 +75,7 @@ function createPlaceholderHandler(
       case "crash":
         console.error("Simulating Consumer crash", {
           documentId: job.documentId,
+          claimId: context.claimId,
         })
         process.exit(70)
     }
