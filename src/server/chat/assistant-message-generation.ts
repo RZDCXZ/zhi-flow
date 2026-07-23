@@ -55,7 +55,25 @@ type GenerationConfig = Readonly<{
   idleTimeoutMs: number
   totalTimeoutMs: number
   maxStreamAttempts: number
+  contentFlushIntervalMs?: number
+  contentFlushMaxChars?: number
 }>
+
+export type GenerationClock = Readonly<{
+  now: () => number
+  setTimeout: (callback: () => void, ms: number) => () => void
+}>
+
+const DEFAULT_CONTENT_FLUSH_INTERVAL_MS = 500
+const DEFAULT_CONTENT_FLUSH_MAX_CHARS = 1_024
+
+const systemClock: GenerationClock = {
+  now: () => Date.now(),
+  setTimeout: (callback, ms) => {
+    const handle = setTimeout(callback, ms)
+    return () => clearTimeout(handle)
+  },
+}
 
 type StartRequest = Readonly<{
   conversationId: string
@@ -152,11 +170,21 @@ type ActiveGeneration = Readonly<{
 
 export class AssistantMessageGenerationModule {
   private readonly activeGenerations = new Map<string, ActiveGeneration>()
+  private readonly contentFlushIntervalMs: number
+  private readonly contentFlushMaxChars: number
+  private readonly clock: GenerationClock
 
   constructor(
     private readonly provider: ChatProvider,
     private readonly config: GenerationConfig,
-  ) {}
+    clock: GenerationClock = systemClock,
+  ) {
+    this.clock = clock
+    this.contentFlushIntervalMs =
+      config.contentFlushIntervalMs ?? DEFAULT_CONTENT_FLUSH_INTERVAL_MS
+    this.contentFlushMaxChars =
+      config.contentFlushMaxChars ?? DEFAULT_CONTENT_FLUSH_MAX_CHARS
+  }
 
   async start(request: StartRequest): Promise<StartGenerationResult> {
     const message = request.message.trim()
@@ -346,7 +374,12 @@ export class AssistantMessageGenerationModule {
       () => totalTimeout.abort(),
       this.config.totalTimeoutMs,
     )
-    let persistedContent = ""
+    const contentBuffer = new CoalescedContentBuffer({
+      assistantMessageId,
+      clock: this.clock,
+      flushIntervalMs: this.contentFlushIntervalMs,
+      flushMaxChars: this.contentFlushMaxChars,
+    })
     const emit = (event: AssistantMessageGenerationEvent) => {
       hub.push(event)
     }
@@ -360,42 +393,41 @@ export class AssistantMessageGenerationModule {
         assistantMessageId,
         startedAt,
         emit,
-        onContent: async (content) => {
-          persistedContent = content
-          return appendAssistantContent(assistantMessageId, content)
-        },
-        onTerminal: async (status, errorCode) =>
-          finishAssistantMessage(
-            assistantMessageId,
-            status,
-            persistedContent,
-            errorCode,
-          ),
+        contentBuffer,
       })
     } catch (error) {
-      if (await this.isCancelled(assistantMessageId)) {
-        emit({ type: "message.cancelled" })
+      if (
+        await this.emitCancelledIfNeeded(
+          assistantMessageId,
+          contentBuffer,
+          emit,
+        )
+      ) {
         return
       }
       const failure =
         error instanceof ChatProviderError
           ? providerErrors[error.kind]
           : internalError
-      const failurePersisted = await finishAssistantMessage(
+      const failurePersisted = await this.commitTerminal(
         assistantMessageId,
         "failed",
-        persistedContent,
+        contentBuffer,
         failure.code,
-      ).catch(() => null)
+      )
       if (failurePersisted === true) {
         emit({ type: "message.failed", error: failure })
       } else if (failurePersisted === false) {
         // Another writer already committed a terminal status.
-        if (await this.isCancelled(assistantMessageId)) {
-          emit({ type: "message.cancelled" })
-        }
+        await this.emitCancelledIfNeeded(
+          assistantMessageId,
+          contentBuffer,
+          emit,
+        )
       }
+      // persistence unavailable → transport interruption, no synthetic terminal
     } finally {
+      contentBuffer.dispose()
       clearTimeout(totalTimer)
       hub.end()
       this.activeGenerations.delete(assistantMessageId)
@@ -408,6 +440,38 @@ export class AssistantMessageGenerationModule {
     )
   }
 
+  private async emitCancelledIfNeeded(
+    assistantMessageId: string,
+    contentBuffer: CoalescedContentBuffer,
+    emit: (event: AssistantMessageGenerationEvent) => void,
+  ): Promise<boolean> {
+    if (!(await this.isCancelled(assistantMessageId))) return false
+    const contentReady = await contentBuffer.forceFlush().catch(() => false)
+    if (!contentReady) return true
+    emit({ type: "message.cancelled" })
+    return true
+  }
+
+  private async commitTerminal(
+    assistantMessageId: string,
+    status: "completed" | "failed",
+    contentBuffer: CoalescedContentBuffer,
+    errorCode: string | null,
+  ): Promise<boolean | null> {
+    try {
+      const contentReady = await contentBuffer.forceFlush()
+      if (!contentReady) return false
+      return await finishAssistantMessage(
+        assistantMessageId,
+        status,
+        contentBuffer.content,
+        errorCode,
+      )
+    } catch {
+      return null
+    }
+  }
+
   private async pipeProviderStream({
     messages,
     cancellation,
@@ -415,8 +479,7 @@ export class AssistantMessageGenerationModule {
     assistantMessageId,
     startedAt,
     emit,
-    onContent,
-    onTerminal,
+    contentBuffer,
   }: Readonly<{
     messages: readonly ChatMessage[]
     cancellation: AbortSignal
@@ -424,14 +487,9 @@ export class AssistantMessageGenerationModule {
     assistantMessageId: string
     startedAt: number
     emit: (event: AssistantMessageGenerationEvent) => void
-    onContent: (content: string) => Promise<boolean>
-    onTerminal: (
-      status: "completed" | "cancelled",
-      errorCode: string | null,
-    ) => Promise<boolean>
+    contentBuffer: CoalescedContentBuffer
   }>): Promise<void> {
     let contentStarted = false
-    let completeContent = ""
 
     for (
       let attempt = 1;
@@ -462,7 +520,11 @@ export class AssistantMessageGenerationModule {
             assistantMessageId,
           )
           if (result === assistantCancelled) {
-            emit({ type: "message.cancelled" })
+            await this.emitCancelledIfNeeded(
+              assistantMessageId,
+              contentBuffer,
+              emit,
+            )
             return
           }
           if (result === assistantTerminalTaken) {
@@ -475,14 +537,16 @@ export class AssistantMessageGenerationModule {
             if (!result.value.delta) continue
             receivedContent = true
             contentStarted = true
-            completeContent += result.value.delta
-            if (!(await onContent(completeContent))) {
-              if (await this.isCancelled(assistantMessageId)) {
-                emit({ type: "message.cancelled" })
-              }
+            contentBuffer.append(result.value.delta)
+            emit({ type: "content.delta", delta: result.value.delta })
+            if (contentBuffer.terminalTaken) {
+              await this.emitCancelledIfNeeded(
+                assistantMessageId,
+                contentBuffer,
+                emit,
+              )
               return
             }
-            emit({ type: "content.delta", delta: result.value.delta })
           } else if (result.value.type === "usage.snapshot") {
             usage = result.value.usage
           }
@@ -492,28 +556,45 @@ export class AssistantMessageGenerationModule {
           throw new ChatProviderError("invalid_response")
         }
         emit({ type: "usage.snapshot", usage })
-        if (!(await onTerminal("completed", null))) {
-          if (await this.isCancelled(assistantMessageId)) {
-            emit({ type: "message.cancelled" })
-          }
+        const completed = await this.commitTerminal(
+          assistantMessageId,
+          "completed",
+          contentBuffer,
+          null,
+        )
+        if (completed === true) {
+          emit({
+            type: "message.completed",
+            latencyMs: Math.round(performance.now() - startedAt),
+          })
           return
         }
-        emit({
-          type: "message.completed",
-          latencyMs: Math.round(performance.now() - startedAt),
-        })
+        if (completed === false) {
+          await this.emitCancelledIfNeeded(
+            assistantMessageId,
+            contentBuffer,
+            emit,
+          )
+        }
+        // completed === null → transport interruption
         return
       } catch (error) {
         // Explicit cancel writes cancelled first then aborts; recovery writes
         // failed first then aborts. Only the DB cancelled status produces events.
         if (cancellation.aborted) {
-          if (await this.isCancelled(assistantMessageId)) {
-            emit({ type: "message.cancelled" })
-          }
+          await this.emitCancelledIfNeeded(
+            assistantMessageId,
+            contentBuffer,
+            emit,
+          )
           return
         }
         if (await this.isCancelled(assistantMessageId)) {
-          emit({ type: "message.cancelled" })
+          await this.emitCancelledIfNeeded(
+            assistantMessageId,
+            contentBuffer,
+            emit,
+          )
           return
         }
         if (totalTimeout.aborted) throw new ChatProviderError("timeout")
@@ -531,6 +612,103 @@ export class AssistantMessageGenerationModule {
       } finally {
         await iterator.return?.()
       }
+    }
+  }
+}
+
+class CoalescedContentBuffer {
+  private completeContent = ""
+  private persistedContent = ""
+  private clearFlushTimer: (() => void) | null = null
+  private flushChain: Promise<void> = Promise.resolve()
+  private disposed = false
+  terminalTaken = false
+
+  constructor(
+    private readonly options: Readonly<{
+      assistantMessageId: string
+      clock: GenerationClock
+      flushIntervalMs: number
+      flushMaxChars: number
+    }>,
+  ) {}
+
+  get content(): string {
+    return this.completeContent
+  }
+
+  append(delta: string): void {
+    this.completeContent += delta
+    if (this.terminalTaken || this.disposed) return
+    if (this.unpersistedCharCount() >= this.options.flushMaxChars) {
+      this.scheduleFlush(true)
+      return
+    }
+    this.scheduleFlush(false)
+  }
+
+  async forceFlush(): Promise<boolean> {
+    this.clearTimer()
+    await this.flushChain
+    if (this.terminalTaken) return false
+    if (this.completeContent === this.persistedContent) return true
+    return this.persistNow()
+  }
+
+  dispose(): void {
+    this.disposed = true
+    this.clearTimer()
+  }
+
+  private unpersistedCharCount(): number {
+    return [...this.completeContent].length - [...this.persistedContent].length
+  }
+
+  private scheduleFlush(immediate: boolean): void {
+    if (immediate) {
+      this.clearTimer()
+      this.enqueueFlush()
+      return
+    }
+    if (this.clearFlushTimer !== null) return
+    this.clearFlushTimer = this.options.clock.setTimeout(() => {
+      this.clearFlushTimer = null
+      this.enqueueFlush()
+    }, this.options.flushIntervalMs)
+  }
+
+  private clearTimer(): void {
+    this.clearFlushTimer?.()
+    this.clearFlushTimer = null
+  }
+
+  private enqueueFlush(): void {
+    this.flushChain = this.flushChain
+      .then(async () => {
+        if (this.disposed || this.terminalTaken) return
+        if (this.completeContent === this.persistedContent) return
+        await this.persistNow()
+      })
+      .catch(() => {
+        // Intermediate flush errors are retried by later flushes / forceFlush.
+      })
+  }
+
+  private async persistNow(): Promise<boolean> {
+    const content = this.completeContent
+    try {
+      const updated = await appendAssistantContent(
+        this.options.assistantMessageId,
+        content,
+      )
+      if (!updated) {
+        this.terminalTaken = true
+        return false
+      }
+      this.persistedContent = content
+      return true
+    } catch {
+      return false
     }
   }
 }

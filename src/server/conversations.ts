@@ -234,12 +234,14 @@ export async function appendAssistantContent(
   assistantMessageId: string,
   content: string,
 ): Promise<boolean> {
+  // streaming: coalesce while generating; cancelled: attach final known text
+  // after an explicit stop wins the terminal race.
   const { data, error } = await createServerDataClient()
     .from("messages")
     .update({ content, updated_at: new Date().toISOString() })
     .eq("id", assistantMessageId)
     .eq("role", "assistant")
-    .eq("status", "streaming")
+    .in("status", ["streaming", "cancelled"])
     .select("id")
     .maybeSingle()
   if (error) throw error

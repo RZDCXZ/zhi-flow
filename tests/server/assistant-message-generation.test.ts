@@ -6,8 +6,10 @@ vi.mock("server-only", () => ({}))
 import {
   AssistantMessageGenerationModule,
   type AssistantMessageGenerationEvent,
+  type GenerationClock,
 } from "../../src/server/chat/assistant-message-generation"
 import { FakeChatProvider } from "../../src/server/chat/fake-chat-provider"
+import * as conversations from "../../src/server/conversations"
 
 const supabaseUrl = "http://127.0.0.1:54321"
 const localServiceRoleKey =
@@ -908,9 +910,8 @@ describe("Assistant Message 生成 module", () => {
       .eq("id", stream.assistantMessageId)
     if (ageError) throw ageError
 
-    const recoverResult = await generation.recoverStaleGenerations(
-      conversationId,
-    )
+    const recoverResult =
+      await generation.recoverStaleGenerations(conversationId)
     expect(recoverResult).toEqual({
       type: "ok",
       recoveredAssistantMessageIds: [stream.assistantMessageId],
@@ -925,21 +926,410 @@ describe("Assistant Message 生成 module", () => {
       .eq("id", stream.assistantMessageId)
       .single()
     if (error) throw error
+    // Coalesced content may not have flushed before recovery won; the bound is
+    // the declared flush threshold, not zero loss. Terminal must stay failed.
     expect(data).toEqual({
       status: "failed",
-      content: "迟到完成",
+      content: expect.any(String),
       error_code: "STREAM_INTERRUPTED",
     })
+    expect(["", "迟到完成"]).toContain(data.content)
+  })
+
+  it("正文 delta 在合并阈值前即可产生，且不逐条等待数据库写入", async () => {
+    const conversationId = await createConversation("正文事件不阻塞")
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: "先" }
+      yield { type: "content.delta", delta: "见" }
+      yield { type: "content.delta", delta: "事件" }
+      await allowCompletion
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 3, totalTokens: 4 },
+      }
+    })
+    const clock = new ControllableClock()
+    const generation = createGeneration(provider, {
+      clock,
+      contentFlushIntervalMs: 60_000,
+      contentFlushMaxChars: 10_000,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "观察流式正文",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const iterator = started.events[Symbol.asyncIterator]()
+    const created = await iterator.next()
+    expect(created.value?.type).toBe("message.created")
+    if (created.value?.type !== "message.created") return
+    const deltas = [
+      await iterator.next(),
+      await iterator.next(),
+      await iterator.next(),
+    ]
+    expect(deltas.map((item) => item.value)).toEqual([
+      { type: "content.delta", delta: "先" },
+      { type: "content.delta", delta: "见" },
+      { type: "content.delta", delta: "事件" },
+    ])
+    await expectAssistantStatus(
+      created.value.assistantMessageId,
+      "streaming",
+      "",
+    )
+
+    releaseCompletion()
+    const remaining: AssistantMessageGenerationEvent[] = []
+    while (true) {
+      const next = await iterator.next()
+      if (next.done) break
+      remaining.push(next.value)
+    }
+    expect(remaining.map((event) => event.type)).toEqual([
+      "usage.snapshot",
+      "message.completed",
+    ])
+    await expectAssistantStatus(
+      created.value.assistantMessageId,
+      "completed",
+      "先见事件",
+    )
+  })
+
+  it("累计达到字符阈值时刷新正文，无需等待时间阈值", async () => {
+    const conversationId = await createConversation("字符阈值刷新")
+    const firstHalf = "字".repeat(512)
+    const secondHalf = "符".repeat(512)
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: firstHalf }
+      yield { type: "content.delta", delta: secondHalf }
+      await allowCompletion
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
+    const clock = new ControllableClock()
+    const generation = createGeneration(provider, {
+      clock,
+      contentFlushMaxChars: 1_024,
+      contentFlushIntervalMs: 60_000,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "字符阈值",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const stream = await takeUntilContentDelta(started.events)
+    await waitForAssistantContent(
+      stream.assistantMessageId,
+      firstHalf + secondHalf,
+    )
+    expect(clock.now()).toBe(0)
+
+    releaseCompletion()
+    await collectEvents(stream.rest)
+    await expectAssistantStatus(
+      stream.assistantMessageId,
+      "completed",
+      firstHalf + secondHalf,
+    )
+  })
+
+  it("累计达到时间阈值时刷新正文，无需等待字符阈值", async () => {
+    const conversationId = await createConversation("时间阈值刷新")
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: "短正文" }
+      await allowCompletion
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
+    const clock = new ControllableClock()
+    const generation = createGeneration(provider, {
+      clock,
+      contentFlushIntervalMs: 500,
+      contentFlushMaxChars: 10_000,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "时间阈值",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const stream = await takeUntilContentDelta(started.events)
+    await expectAssistantStatus(stream.assistantMessageId, "streaming", "")
+
+    await clock.advance(500)
+    await waitForAssistantContent(stream.assistantMessageId, "短正文")
+
+    releaseCompletion()
+    await collectEvents(stream.rest)
+    await expectAssistantStatus(
+      stream.assistantMessageId,
+      "completed",
+      "短正文",
+    )
+  })
+
+  it("进入终态前强制刷新未达阈值的正文", async () => {
+    const conversationId = await createConversation("终态强制刷新")
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: "未达阈值" }
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
+    const clock = new ControllableClock()
+    const generation = createGeneration(provider, {
+      clock,
+      contentFlushIntervalMs: 60_000,
+      contentFlushMaxChars: 10_000,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "强制刷新",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const events = await collectEvents(started.events)
+    expect(events.at(-1)?.type).toBe("message.completed")
+    const created = events[0]
+    expect(created?.type).toBe("message.created")
+    if (created?.type !== "message.created") return
+    await expectAssistantStatus(
+      created.assistantMessageId,
+      "completed",
+      "未达阈值",
+    )
+    expect(clock.now()).toBe(0)
+  })
+
+  it("取消时也会强制刷新未持久化正文后再暴露 cancelled", async () => {
+    const conversationId = await createConversation("取消强制刷新")
+    const provider = new FakeChatProvider(async function* (request) {
+      yield { type: "content.delta", delta: "取消前尾段" }
+      await waitForAbort(request.signal)
+    })
+    const clock = new ControllableClock()
+    const generation = createGeneration(provider, {
+      clock,
+      contentFlushIntervalMs: 60_000,
+      contentFlushMaxChars: 10_000,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "取消并刷新",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const stream = await takeUntilContentDelta(started.events)
+    await expectAssistantStatus(stream.assistantMessageId, "streaming", "")
+
+    const cancelResult = await generation.cancel(stream.assistantMessageId)
+    const events = await collectEvents(stream.rest)
+
+    expect(cancelResult).toEqual({ type: "accepted", status: "cancelled" })
+    expect(events.at(-1)).toEqual({ type: "message.cancelled" })
+    await expectAssistantStatus(
+      stream.assistantMessageId,
+      "cancelled",
+      "取消前尾段",
+    )
+  })
+
+  it("部分正文后 Provider 中断时仍强制持久化已知正文并失败终态", async () => {
+    const conversationId = await createConversation("部分正文失败")
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: "已经说出的部分" }
+      throw new Error("stream died")
+    })
+    const clock = new ControllableClock()
+    const generation = createGeneration(provider, {
+      clock,
+      contentFlushIntervalMs: 60_000,
+      contentFlushMaxChars: 10_000,
+    })
+
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "中断",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const events = await collectEvents(started.events)
+    expect(events.map((event) => event.type)).toEqual([
+      "message.created",
+      "content.delta",
+      "message.failed",
+    ])
+    const created = events[0]
+    expect(created?.type).toBe("message.created")
+    if (created?.type !== "message.created") return
+
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("status,content,error_code")
+      .eq("id", created.assistantMessageId)
+      .single()
+    if (error) throw error
+    expect(data).toEqual({
+      status: "failed",
+      content: "已经说出的部分",
+      error_code: "PROVIDER_UNAVAILABLE",
+    })
+  })
+
+  it("终态提交不可用时以 transport interruption 结束，不产生伪 message.failed", async () => {
+    const conversationId = await createConversation("持久化不可用")
+    const provider = successfulProvider("无法落库的正文")
+    const finishSpy = vi
+      .spyOn(conversations, "finishAssistantMessage")
+      .mockRejectedValue(new Error("database unavailable"))
+    const generation = createGeneration(provider, {
+      contentFlushIntervalMs: 60_000,
+      contentFlushMaxChars: 10_000,
+    })
+
+    try {
+      const started = await generation.start({
+        conversationId,
+        clientIdempotencyKey: crypto.randomUUID(),
+        message: "终态写失败",
+      })
+      expect(started.type).toBe("started")
+      if (started.type !== "started") return
+
+      const events = await collectEvents(started.events)
+      expect(events.map((event) => event.type)).toEqual([
+        "message.created",
+        "content.delta",
+        "usage.snapshot",
+      ])
+      expect(events.some((event) => event.type === "message.failed")).toBe(
+        false,
+      )
+      expect(events.some((event) => event.type === "message.completed")).toBe(
+        false,
+      )
+      expect(events.some((event) => event.type === "message.cancelled")).toBe(
+        false,
+      )
+
+      const created = events[0]
+      expect(created?.type).toBe("message.created")
+      if (created?.type !== "message.created") return
+      await expectAssistantStatus(
+        created.assistantMessageId,
+        "streaming",
+        "无法落库的正文",
+      )
+    } finally {
+      finishSpy.mockRestore()
+    }
   })
 })
 
-function createGeneration(provider: FakeChatProvider) {
-  return new AssistantMessageGenerationModule(provider, {
-    firstByteTimeoutMs: 1_000,
-    idleTimeoutMs: 1_000,
-    totalTimeoutMs: 5_000,
-    maxStreamAttempts: 1,
-  })
+function createGeneration(
+  provider: FakeChatProvider,
+  options: {
+    clock?: GenerationClock
+    contentFlushIntervalMs?: number
+    contentFlushMaxChars?: number
+    totalTimeoutMs?: number
+  } = {},
+) {
+  return new AssistantMessageGenerationModule(
+    provider,
+    {
+      firstByteTimeoutMs: 1_000,
+      idleTimeoutMs: 1_000,
+      totalTimeoutMs: options.totalTimeoutMs ?? 5_000,
+      maxStreamAttempts: 1,
+      contentFlushIntervalMs: options.contentFlushIntervalMs,
+      contentFlushMaxChars: options.contentFlushMaxChars,
+    },
+    options.clock,
+  )
+}
+
+class ControllableClock implements GenerationClock {
+  private currentMs = 0
+  private readonly timers = new Map<
+    number,
+    { dueMs: number; callback: () => void }
+  >()
+  private nextTimerId = 1
+
+  now(): number {
+    return this.currentMs
+  }
+
+  setTimeout(callback: () => void, ms: number): () => void {
+    const id = this.nextTimerId
+    this.nextTimerId += 1
+    this.timers.set(id, { dueMs: this.currentMs + ms, callback })
+    return () => {
+      this.timers.delete(id)
+    }
+  }
+
+  async advance(ms: number): Promise<void> {
+    const target = this.currentMs + ms
+    while (this.timers.size > 0) {
+      let nextId: number | undefined
+      let nextDue = Number.POSITIVE_INFINITY
+      for (const [id, timer] of this.timers) {
+        if (timer.dueMs <= target && timer.dueMs < nextDue) {
+          nextId = id
+          nextDue = timer.dueMs
+        }
+      }
+      if (nextId === undefined) break
+      const timer = this.timers.get(nextId)
+      if (timer === undefined) break
+      this.timers.delete(nextId)
+      this.currentMs = timer.dueMs
+      timer.callback()
+      await Promise.resolve()
+      await Promise.resolve()
+    }
+    this.currentMs = target
+  }
 }
 
 function successfulProvider(content: string) {
@@ -1041,6 +1431,30 @@ async function expectAssistantStatus(
   })
 }
 
+async function waitForAssistantContent(
+  assistantMessageId: string,
+  content: string,
+): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("content")
+      .eq("id", assistantMessageId)
+      .single()
+    if (error) throw error
+    if (data.content === content) return
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  const { data, error } = await dataClient
+    .from("messages")
+    .select("content")
+    .eq("id", assistantMessageId)
+    .single()
+  if (error) throw error
+  expect(data.content).toBe(content)
+}
+
 async function waitForProviderRequests(
   provider: FakeChatProvider,
   count: number,
@@ -1079,7 +1493,9 @@ async function waitForAssistantStatus(
   await expectAssistantStatus(assistantMessageId, status, content)
 }
 
-async function waitForAssistantTerminal(conversationId: string): Promise<string> {
+async function waitForAssistantTerminal(
+  conversationId: string,
+): Promise<string> {
   const deadline = Date.now() + 5_000
   while (Date.now() < deadline) {
     const { data, error } = await dataClient
