@@ -243,7 +243,18 @@ describe("Assistant Message 生成 module", () => {
   it("在终态前后重放相同提交并返回已有 Message 与持久化状态", async () => {
     const conversationId = await createConversation("幂等重放")
     const idempotencyKey = crypto.randomUUID()
-    const provider = successfulProvider("只生成一次")
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: "只生成一次" }
+      await allowCompletion
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
     const generation = createGeneration(provider)
 
     const first = await generation.start({
@@ -253,6 +264,7 @@ describe("Assistant Message 生成 module", () => {
     })
     expect(first.type).toBe("started")
     if (first.type !== "started") return
+    const stream = await takeUntilContentDelta(first.events)
 
     const replayWhileStreaming = await generation.start({
       conversationId,
@@ -263,21 +275,19 @@ describe("Assistant Message 生成 module", () => {
       type: "idempotency-replay",
       submission: {
         userMessageId: expect.any(String),
-        assistantMessageId: expect.any(String),
+        assistantMessageId: stream.assistantMessageId,
         assistantMessageStatus: "streaming",
       },
       error: { code: "IDEMPOTENCY_REPLAY" },
     })
-    expect(provider.requests).toHaveLength(0)
+    expect(provider.requests).toHaveLength(1)
 
-    const events = await collectEvents(first.events)
-    const created = events[0]
-    expect(created?.type).toBe("message.created")
-    if (created?.type !== "message.created") return
+    releaseCompletion()
+    const events = await collectEvents(stream.rest)
+    expect(events.at(-1)?.type).toBe("message.completed")
     expect(replayWhileStreaming).toMatchObject({
       submission: {
-        userMessageId: created.userMessageId,
-        assistantMessageId: created.assistantMessageId,
+        assistantMessageId: stream.assistantMessageId,
       },
     })
 
@@ -286,11 +296,10 @@ describe("Assistant Message 生成 module", () => {
       clientIdempotencyKey: idempotencyKey,
       message: "安全重试",
     })
-    expect(replayAfterCompletion).toEqual({
+    expect(replayAfterCompletion).toMatchObject({
       type: "idempotency-replay",
       submission: {
-        userMessageId: created.userMessageId,
-        assistantMessageId: created.assistantMessageId,
+        assistantMessageId: stream.assistantMessageId,
         assistantMessageStatus: "completed",
       },
       error: {
@@ -305,7 +314,18 @@ describe("Assistant Message 生成 module", () => {
   it("拒绝用不同正文复用幂等键且不泄露旧正文或调用 Provider", async () => {
     const conversationId = await createConversation("幂等键正文冲突")
     const idempotencyKey = crypto.randomUUID()
-    const provider = successfulProvider("不会重复生成")
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* () {
+      await allowCompletion
+      yield { type: "content.delta", delta: "不会重复生成" }
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
     const generation = createGeneration(provider)
     const first = await generation.start({
       conversationId,
@@ -314,6 +334,7 @@ describe("Assistant Message 生成 module", () => {
     })
     expect(first.type).toBe("started")
     if (first.type !== "started") return
+    await waitForProviderRequests(provider, 1)
 
     const reused = await generation.start({
       conversationId,
@@ -331,7 +352,7 @@ describe("Assistant Message 生成 module", () => {
       },
     })
     expect(JSON.stringify(reused)).not.toContain("原始正文")
-    expect(provider.requests).toHaveLength(0)
+    expect(provider.requests).toHaveLength(1)
 
     const { data: messages, error } = await dataClient
       .from("messages")
@@ -345,13 +366,25 @@ describe("Assistant Message 生成 module", () => {
       { role: "assistant", content: "", status: "streaming" },
     ])
 
+    releaseCompletion()
     await collectEvents(first.events)
     expect(provider.requests).toHaveLength(1)
   })
 
   it("并发提交同一 Conversation 时只启动一个生成并返回活动 Assistant Message", async () => {
     const conversationId = await createConversation("单活动生成")
-    const provider = successfulProvider("竞争获胜")
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* () {
+      await allowCompletion
+      yield { type: "content.delta", delta: "竞争获胜" }
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
     const generation = createGeneration(provider)
 
     const results = await Promise.all([
@@ -377,9 +410,11 @@ describe("Assistant Message 生成 module", () => {
       assistantMessageId: expect.any(String),
       error: { code: "GENERATION_IN_PROGRESS" },
     })
-    expect(provider.requests).toHaveLength(0)
+    await waitForProviderRequests(provider, 1)
+    expect(provider.requests).toHaveLength(1)
     if (started?.type !== "started") return
 
+    releaseCompletion()
     const events = await collectEvents(started.events)
     const created = events[0]
     expect(created?.type).toBe("message.created")
@@ -658,6 +693,244 @@ describe("Assistant Message 生成 module", () => {
       "竞争正文",
     )
   })
+
+  it("订阅者断开时不取消 Provider，生成继续并到达 completed", async () => {
+    const conversationId = await createConversation("订阅断开继续")
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* (request) {
+      yield { type: "content.delta", delta: "断线后仍继续" }
+      await allowCompletion
+      expect(request.signal.aborted).toBe(false)
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
+    const generation = createGeneration(provider)
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "断线后继续",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const stream = await takeUntilContentDelta(started.events)
+    const iterator = stream.rest[Symbol.asyncIterator]()
+    await iterator.return?.()
+
+    releaseCompletion()
+    await waitForAssistantStatus(
+      stream.assistantMessageId,
+      "completed",
+      "断线后仍继续",
+    )
+    expect(provider.requests[0]?.signal.aborted).toBe(false)
+  })
+
+  it("没有订阅者时活动生成仍可继续持久化并到达终态", async () => {
+    const conversationId = await createConversation("无订阅者继续")
+    const provider = successfulProvider("无订阅者也完成")
+    const generation = createGeneration(provider)
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "无人订阅",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const iterator = started.events[Symbol.asyncIterator]()
+    await iterator.return?.()
+
+    const assistantMessageId = await waitForAssistantTerminal(conversationId)
+    await expectAssistantStatus(
+      assistantMessageId,
+      "completed",
+      "无订阅者也完成",
+    )
+    expect(provider.requests).toHaveLength(1)
+  })
+
+  it("显式停止仍是产生 cancelled 终态的唯一方式；断开订阅不写 cancelled", async () => {
+    const conversationId = await createConversation("断开不是取消")
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: "不会被取消" }
+      await allowCompletion
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
+    const generation = createGeneration(provider)
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "断开不是取消",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+    const stream = await takeUntilContentDelta(started.events)
+    await stream.rest[Symbol.asyncIterator]().return?.()
+    releaseCompletion()
+    await waitForAssistantStatus(
+      stream.assistantMessageId,
+      "completed",
+      "不会被取消",
+    )
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("status")
+      .eq("id", stream.assistantMessageId)
+      .single()
+    if (error) throw error
+    expect(data.status).not.toBe("cancelled")
+  })
+
+  it("可将遗留的正在生成 Assistant Message 恢复为 failed 并保存 STREAM_INTERRUPTED", async () => {
+    const conversationId = await createConversation("遗留恢复")
+    const assistantMessageId = await insertStaleStreamingAssistant(
+      conversationId,
+      "刷新前的部分回答",
+      10 * 60_000,
+    )
+    const generation = createGeneration(successfulProvider("不应调用"))
+
+    const result = await generation.recoverStaleGenerations(conversationId)
+
+    expect(result).toEqual({
+      type: "ok",
+      recoveredAssistantMessageIds: [assistantMessageId],
+    })
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("status,content,error_code")
+      .eq("id", assistantMessageId)
+      .single()
+    if (error) throw error
+    expect(data).toEqual({
+      status: "failed",
+      content: "刷新前的部分回答",
+      error_code: "STREAM_INTERRUPTED",
+    })
+  })
+
+  it("不恢复仍在有效时限内或已终态的 Assistant Message", async () => {
+    const conversationId = await createConversation("有效期内不恢复")
+    const freshId = await insertStaleStreamingAssistant(
+      conversationId,
+      "仍在生成",
+      0,
+    )
+    const completedConversationId = await createConversation("已终态不恢复")
+    const { data: userMessage, error: userError } = await dataClient
+      .from("messages")
+      .insert({
+        conversation_id: completedConversationId,
+        role: "user",
+        content: "已完成问题",
+        status: "completed",
+        client_idempotency_key: crypto.randomUUID(),
+      })
+      .select("id")
+      .single()
+    if (userError) throw userError
+    const { data: completed, error: completedError } = await dataClient
+      .from("messages")
+      .insert({
+        conversation_id: completedConversationId,
+        role: "assistant",
+        content: "已完成回答",
+        status: "completed",
+        source_message_id: userMessage.id,
+      })
+      .select("id")
+      .single()
+    if (completedError) throw completedError
+
+    const generation = createGeneration(successfulProvider("x"))
+    await expect(
+      generation.recoverStaleGenerations(conversationId),
+    ).resolves.toEqual({
+      type: "ok",
+      recoveredAssistantMessageIds: [],
+    })
+    await expect(
+      generation.recoverStaleGenerations(completedConversationId),
+    ).resolves.toEqual({
+      type: "ok",
+      recoveredAssistantMessageIds: [],
+    })
+    await expectAssistantStatus(freshId, "streaming", "仍在生成")
+    await expectAssistantStatus(completed.id, "completed", "已完成回答")
+  })
+
+  it("恢复与迟到 Provider 完成竞争时终态不被覆盖", async () => {
+    const conversationId = await createConversation("恢复竞争")
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: "迟到完成" }
+      await allowCompletion
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
+    const generation = new AssistantMessageGenerationModule(provider, {
+      firstByteTimeoutMs: 1_000,
+      idleTimeoutMs: 1_000,
+      totalTimeoutMs: 1_000,
+      maxStreamAttempts: 1,
+    })
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "恢复竞争",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+    const stream = await takeUntilContentDelta(started.events)
+
+    const agedAt = new Date(Date.now() - 5_000).toISOString()
+    const { error: ageError } = await dataClient
+      .from("messages")
+      .update({ updated_at: agedAt })
+      .eq("id", stream.assistantMessageId)
+    if (ageError) throw ageError
+
+    const recoverResult = await generation.recoverStaleGenerations(
+      conversationId,
+    )
+    expect(recoverResult).toEqual({
+      type: "ok",
+      recoveredAssistantMessageIds: [stream.assistantMessageId],
+    })
+
+    releaseCompletion()
+    await collectEvents(stream.rest)
+
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("status,content,error_code")
+      .eq("id", stream.assistantMessageId)
+      .single()
+    if (error) throw error
+    expect(data).toEqual({
+      status: "failed",
+      content: "迟到完成",
+      error_code: "STREAM_INTERRUPTED",
+    })
+  })
 })
 
 function createGeneration(provider: FakeChatProvider) {
@@ -766,6 +1039,100 @@ async function expectAssistantStatus(
     content,
     error_code: null,
   })
+}
+
+async function waitForProviderRequests(
+  provider: FakeChatProvider,
+  count: number,
+): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    if (provider.requests.length >= count) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  expect(provider.requests).toHaveLength(count)
+}
+
+async function waitForAssistantStatus(
+  assistantMessageId: string,
+  status: "streaming" | "completed" | "cancelled" | "failed",
+  content: string,
+): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("status,content,error_code")
+      .eq("id", assistantMessageId)
+      .single()
+    if (error) throw error
+    if (data.status === status && data.content === content) {
+      expect(data).toEqual({
+        status,
+        content,
+        error_code: null,
+      })
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  await expectAssistantStatus(assistantMessageId, status, content)
+}
+
+async function waitForAssistantTerminal(conversationId: string): Promise<string> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const { data, error } = await dataClient
+      .from("messages")
+      .select("id,status")
+      .eq("conversation_id", conversationId)
+      .eq("role", "assistant")
+      .maybeSingle()
+    if (error) throw error
+    if (
+      data &&
+      (data.status === "completed" ||
+        data.status === "cancelled" ||
+        data.status === "failed")
+    ) {
+      return data.id
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error("等待 Assistant Message 终态超时")
+}
+
+async function insertStaleStreamingAssistant(
+  conversationId: string,
+  content: string,
+  ageMs: number,
+): Promise<string> {
+  const { data: userMessage, error: userError } = await dataClient
+    .from("messages")
+    .insert({
+      conversation_id: conversationId,
+      role: "user",
+      content: "遗留问题",
+      status: "completed",
+      client_idempotency_key: crypto.randomUUID(),
+    })
+    .select("id")
+    .single()
+  if (userError) throw userError
+  const { data: assistant, error: assistantError } = await dataClient
+    .from("messages")
+    .insert({
+      conversation_id: conversationId,
+      role: "assistant",
+      content,
+      status: "streaming",
+      source_message_id: userMessage.id,
+      updated_at: new Date(Date.now() - ageMs).toISOString(),
+    })
+    .select("id")
+    .single()
+  if (assistantError) throw assistantError
+  return assistant.id
 }
 
 async function createConversation(title: string): Promise<string> {

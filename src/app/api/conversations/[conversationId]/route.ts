@@ -1,3 +1,4 @@
+import { assistantMessageGeneration } from "@/server/composition-root"
 import {
   deleteConversation,
   readConversation,
@@ -13,6 +14,9 @@ type RouteContext = Readonly<{
 export async function GET(_request: Request, context: RouteContext) {
   const { conversationId } = await context.params
   try {
+    const recovery =
+      await assistantMessageGeneration.recoverStaleGenerations(conversationId)
+    if (recovery.type === "unavailable") return dataError()
     const result = await readConversation(conversationId)
     return result === null ? notFound() : Response.json(result)
   } catch {

@@ -7,6 +7,7 @@ import {
   appendAssistantContent,
   cancelAssistantMessage,
   createMessageSubmission,
+  failStaleStreamingAssistantMessages,
   finishAssistantMessage,
   readAssistantMessageStatus,
   readChatContext,
@@ -61,7 +62,6 @@ type StartRequest = Readonly<{
   clientIdempotencyKey: string
   message: string
   requestId?: string
-  disconnected?: AbortSignal
 }>
 
 export type StartGenerationResult =
@@ -101,6 +101,13 @@ export type CancelGenerationResult =
   | Readonly<{ type: "not-found" }>
   | Readonly<{ type: "unavailable" }>
 
+export type RecoverStaleGenerationsResult =
+  | Readonly<{
+      type: "ok"
+      recoveredAssistantMessageIds: readonly string[]
+    }>
+  | Readonly<{ type: "unavailable" }>
+
 const providerUnavailableError = {
   code: "PROVIDER_UNAVAILABLE",
   message: "聊天服务暂时不可用，请稍后重试。",
@@ -138,8 +145,13 @@ const internalError = {
   retryable: true,
 } satisfies AssistantMessageGenerationError
 
+type ActiveGeneration = Readonly<{
+  cancellation: AbortController
+  hub: EventHub
+}>
+
 export class AssistantMessageGenerationModule {
-  private readonly activeGenerations = new Map<string, AbortController>()
+  private readonly activeGenerations = new Map<string, ActiveGeneration>()
 
   constructor(
     private readonly provider: ChatProvider,
@@ -258,24 +270,30 @@ export class AssistantMessageGenerationModule {
     }
 
     const cancellation = new AbortController()
-    this.activeGenerations.set(attempt.assistantMessageId, cancellation)
+    const hub = new EventHub()
+    this.activeGenerations.set(attempt.assistantMessageId, {
+      cancellation,
+      hub,
+    })
+
+    void this.runGeneration({
+      messages: [...context.messages, { role: "user", content: message }],
+      cancellation,
+      userMessageId: attempt.userMessageId,
+      assistantMessageId: attempt.assistantMessageId,
+      hub,
+    })
 
     return {
       type: "started",
-      events: this.generate({
-        messages: [...context.messages, { role: "user", content: message }],
-        cancellation,
-        disconnected: request.disconnected ?? new AbortController().signal,
-        userMessageId: attempt.userMessageId,
-        assistantMessageId: attempt.assistantMessageId,
-      }),
+      events: hub.asIterable(),
     }
   }
 
   async cancel(assistantMessageId: string): Promise<CancelGenerationResult> {
     try {
       const result = await cancelAssistantMessage(assistantMessageId)
-      this.activeGenerations.get(assistantMessageId)?.abort()
+      this.activeGenerations.get(assistantMessageId)?.cancellation.abort()
       if (
         result.outcome === "cancelled" ||
         result.outcome === "already-cancelled"
@@ -291,19 +309,37 @@ export class AssistantMessageGenerationModule {
     }
   }
 
-  private async *generate({
+  async recoverStaleGenerations(
+    conversationId: string,
+  ): Promise<RecoverStaleGenerationsResult> {
+    try {
+      const staleBefore = new Date(
+        Date.now() - this.config.totalTimeoutMs,
+      ).toISOString()
+      const recoveredAssistantMessageIds =
+        await failStaleStreamingAssistantMessages(conversationId, staleBefore)
+      for (const assistantMessageId of recoveredAssistantMessageIds) {
+        this.activeGenerations.get(assistantMessageId)?.cancellation.abort()
+      }
+      return { type: "ok", recoveredAssistantMessageIds }
+    } catch {
+      return { type: "unavailable" }
+    }
+  }
+
+  private async runGeneration({
     messages,
     cancellation,
-    disconnected,
     userMessageId,
     assistantMessageId,
+    hub,
   }: Readonly<{
     messages: readonly ChatMessage[]
     cancellation: AbortController
-    disconnected: AbortSignal
     userMessageId: string
     assistantMessageId: string
-  }>): AsyncGenerator<AssistantMessageGenerationEvent> {
+    hub: EventHub
+  }>): Promise<void> {
     const startedAt = performance.now()
     const totalTimeout = new AbortController()
     const totalTimer = setTimeout(
@@ -311,16 +347,19 @@ export class AssistantMessageGenerationModule {
       this.config.totalTimeoutMs,
     )
     let persistedContent = ""
+    const emit = (event: AssistantMessageGenerationEvent) => {
+      hub.push(event)
+    }
 
     try {
-      yield { type: "message.created", userMessageId, assistantMessageId }
-      yield* this.pipeProviderStream({
+      emit({ type: "message.created", userMessageId, assistantMessageId })
+      await this.pipeProviderStream({
         messages,
         cancellation: cancellation.signal,
-        disconnected,
         totalTimeout: totalTimeout.signal,
         assistantMessageId,
         startedAt,
+        emit,
         onContent: async (content) => {
           persistedContent = content
           return appendAssistantContent(assistantMessageId, content)
@@ -334,8 +373,8 @@ export class AssistantMessageGenerationModule {
           ),
       })
     } catch (error) {
-      if (await this.emitIfCancelled(assistantMessageId)) {
-        yield { type: "message.cancelled" }
+      if (await this.isCancelled(assistantMessageId)) {
+        emit({ type: "message.cancelled" })
         return
       }
       const failure =
@@ -349,49 +388,48 @@ export class AssistantMessageGenerationModule {
         failure.code,
       ).catch(() => null)
       if (failurePersisted === true) {
-        yield { type: "message.failed", error: failure }
+        emit({ type: "message.failed", error: failure })
       } else if (failurePersisted === false) {
         // Another writer already committed a terminal status.
-        if (
-          (await readAssistantMessageStatus(assistantMessageId)) === "cancelled"
-        ) {
-          yield { type: "message.cancelled" }
+        if (await this.isCancelled(assistantMessageId)) {
+          emit({ type: "message.cancelled" })
         }
       }
     } finally {
       clearTimeout(totalTimer)
+      hub.end()
       this.activeGenerations.delete(assistantMessageId)
     }
   }
 
-  private async emitIfCancelled(assistantMessageId: string): Promise<boolean> {
+  private async isCancelled(assistantMessageId: string): Promise<boolean> {
     return (
       (await readAssistantMessageStatus(assistantMessageId)) === "cancelled"
     )
   }
 
-  private async *pipeProviderStream({
+  private async pipeProviderStream({
     messages,
     cancellation,
-    disconnected,
     totalTimeout,
     assistantMessageId,
     startedAt,
+    emit,
     onContent,
     onTerminal,
   }: Readonly<{
     messages: readonly ChatMessage[]
     cancellation: AbortSignal
-    disconnected: AbortSignal
     totalTimeout: AbortSignal
     assistantMessageId: string
     startedAt: number
+    emit: (event: AssistantMessageGenerationEvent) => void
     onContent: (content: string) => Promise<boolean>
     onTerminal: (
       status: "completed" | "cancelled",
       errorCode: string | null,
     ) => Promise<boolean>
-  }>): AsyncGenerator<AssistantMessageGenerationEvent> {
+  }>): Promise<void> {
     let contentStarted = false
     let completeContent = ""
 
@@ -403,7 +441,6 @@ export class AssistantMessageGenerationModule {
       const attemptTimeout = new AbortController()
       const signal = AbortSignal.any([
         cancellation,
-        disconnected,
         totalTimeout,
         attemptTimeout.signal,
       ])
@@ -425,7 +462,7 @@ export class AssistantMessageGenerationModule {
             assistantMessageId,
           )
           if (result === assistantCancelled) {
-            yield { type: "message.cancelled" }
+            emit({ type: "message.cancelled" })
             return
           }
           if (result === assistantTerminalTaken) {
@@ -440,12 +477,12 @@ export class AssistantMessageGenerationModule {
             contentStarted = true
             completeContent += result.value.delta
             if (!(await onContent(completeContent))) {
-              if (await this.emitIfCancelled(assistantMessageId)) {
-                yield { type: "message.cancelled" }
+              if (await this.isCancelled(assistantMessageId)) {
+                emit({ type: "message.cancelled" })
               }
               return
             }
-            yield { type: "content.delta", delta: result.value.delta }
+            emit({ type: "content.delta", delta: result.value.delta })
           } else if (result.value.type === "usage.snapshot") {
             usage = result.value.usage
           }
@@ -454,28 +491,29 @@ export class AssistantMessageGenerationModule {
         if (!receivedContent || usage === null) {
           throw new ChatProviderError("invalid_response")
         }
-        yield { type: "usage.snapshot", usage }
+        emit({ type: "usage.snapshot", usage })
         if (!(await onTerminal("completed", null))) {
-          if (await this.emitIfCancelled(assistantMessageId)) {
-            yield { type: "message.cancelled" }
+          if (await this.isCancelled(assistantMessageId)) {
+            emit({ type: "message.cancelled" })
           }
           return
         }
-        yield {
+        emit({
           type: "message.completed",
           latencyMs: Math.round(performance.now() - startedAt),
-        }
+        })
         return
       } catch (error) {
-        if (cancellation.aborted || disconnected.aborted) {
-          const cancelled = await onTerminal("cancelled", null)
-          if (cancelled || (await this.emitIfCancelled(assistantMessageId))) {
-            yield { type: "message.cancelled" }
+        // Explicit cancel writes cancelled first then aborts; recovery writes
+        // failed first then aborts. Only the DB cancelled status produces events.
+        if (cancellation.aborted) {
+          if (await this.isCancelled(assistantMessageId)) {
+            emit({ type: "message.cancelled" })
           }
           return
         }
-        if (await this.emitIfCancelled(assistantMessageId)) {
-          yield { type: "message.cancelled" }
+        if (await this.isCancelled(assistantMessageId)) {
+          emit({ type: "message.cancelled" })
           return
         }
         if (totalTimeout.aborted) throw new ChatProviderError("timeout")
@@ -494,6 +532,72 @@ export class AssistantMessageGenerationModule {
         await iterator.return?.()
       }
     }
+  }
+}
+
+class EventHub {
+  private readonly queue: AssistantMessageGenerationEvent[] = []
+  private readonly waiters: Array<
+    (result: IteratorResult<AssistantMessageGenerationEvent>) => void
+  > = []
+  private closed = false
+  private ended = false
+
+  push(event: AssistantMessageGenerationEvent): void {
+    if (this.closed || this.ended) return
+    const waiter = this.waiters.shift()
+    if (waiter) {
+      waiter({ done: false, value: event })
+      return
+    }
+    this.queue.push(event)
+  }
+
+  end(): void {
+    if (this.ended) return
+    this.ended = true
+    while (this.waiters.length > 0) {
+      this.waiters.shift()?.({ done: true, value: undefined })
+    }
+  }
+
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    this.queue.length = 0
+    while (this.waiters.length > 0) {
+      this.waiters.shift()?.({ done: true, value: undefined })
+    }
+  }
+
+  asIterable(): AsyncIterable<AssistantMessageGenerationEvent> {
+    return {
+      [Symbol.asyncIterator]: () => ({
+        next: () => this.next(),
+        return: async () => {
+          this.close()
+          return { done: true as const, value: undefined }
+        },
+      }),
+    }
+  }
+
+  private next(): Promise<IteratorResult<AssistantMessageGenerationEvent>> {
+    if (this.closed) {
+      return Promise.resolve({ done: true, value: undefined })
+    }
+    if (this.queue.length > 0) {
+      return Promise.resolve({
+        done: false,
+        value: this.queue.shift()!,
+      })
+    }
+    if (this.ended) {
+      return Promise.resolve({ done: true, value: undefined })
+    }
+    return new Promise((resolve) => {
+      this.waiters.push(resolve)
+    })
   }
 }
 

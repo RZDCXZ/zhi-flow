@@ -4,7 +4,6 @@ import type { Conversation, Message } from "@/lib/conversation-api"
 import { GENERAL_CHAT_CONTEXT_MESSAGE_LIMIT } from "@/lib/chat-api"
 import type { ChatMessage } from "@/server/chat/chat-provider"
 
-import { serverConfig } from "./config"
 import { createServerDataClient } from "./supabase"
 
 type ConversationRow = Readonly<{
@@ -96,22 +95,6 @@ export async function readConversation(
   if (conversationError) throw conversationError
   if (conversation === null) return null
 
-  const staleBefore = new Date(
-    Date.now() - serverConfig.chat.totalTimeoutMs,
-  ).toISOString()
-  const { error: recoveryError } = await client
-    .from("messages")
-    .update({
-      status: "failed",
-      error_code: "STREAM_INTERRUPTED",
-      updated_at: new Date().toISOString(),
-    })
-    .eq("conversation_id", conversationId)
-    .eq("role", "assistant")
-    .eq("status", "streaming")
-    .lt("updated_at", staleBefore)
-  if (recoveryError) throw recoveryError
-
   const { data: messages, error: messagesError } = await client
     .from("messages")
     .select(messageColumns)
@@ -124,6 +107,26 @@ export async function readConversation(
     conversation: toConversation(conversation as ConversationRow),
     messages: (messages as MessageRow[]).map(toMessage),
   }
+}
+
+export async function failStaleStreamingAssistantMessages(
+  conversationId: string,
+  staleBefore: string,
+): Promise<string[]> {
+  const { data, error } = await createServerDataClient()
+    .from("messages")
+    .update({
+      status: "failed",
+      error_code: "STREAM_INTERRUPTED",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("conversation_id", conversationId)
+    .eq("role", "assistant")
+    .eq("status", "streaming")
+    .lt("updated_at", staleBefore)
+    .select("id")
+  if (error) throw error
+  return (data ?? []).map((row) => row.id as string)
 }
 
 export async function renameConversation(

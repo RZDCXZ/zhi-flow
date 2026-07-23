@@ -27,7 +27,6 @@ export async function POST(request: Request) {
   const result = await assistantMessageGeneration.start({
     ...body,
     requestId,
-    disconnected: request.signal,
   })
   if (result.type !== "started") {
     return chatError(
@@ -112,6 +111,7 @@ function createResponseStream(
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
   let consumerCancelled = false
+  const iterator = events[Symbol.asyncIterator]()
 
   return new ReadableStream({
     start(controller) {
@@ -131,10 +131,12 @@ function createResponseStream(
 
       void (async () => {
         try {
-          for await (const event of events) {
+          while (!consumerCancelled) {
+            const next = await iterator.next()
+            if (next.done) break
             sequence += 1
             const data = {
-              ...event,
+              ...next.value,
               version: CHAT_STREAM_PROTOCOL_VERSION,
               requestId,
               sequence,
@@ -148,12 +150,14 @@ function createResponseStream(
           }
         } finally {
           clearInterval(heartbeatTimer)
+          await iterator.return?.()
           if (!consumerCancelled) controller.close()
         }
       })()
     },
     cancel() {
       consumerCancelled = true
+      void iterator.return?.()
     },
   })
 }
