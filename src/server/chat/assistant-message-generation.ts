@@ -8,7 +8,7 @@ import {
   cancelAssistantMessage,
   createMessageSubmission,
   finishAssistantMessage,
-  isAssistantMessageStreaming,
+  readAssistantMessageStatus,
   readChatContext,
 } from "@/server/conversations"
 
@@ -96,7 +96,8 @@ export type StartGenerationResult =
     }>
 
 export type CancelGenerationResult =
-  | Readonly<{ type: "accepted" }>
+  | Readonly<{ type: "accepted"; status: "cancelled" }>
+  | Readonly<{ type: "terminal-conflict"; status: "completed" | "failed" }>
   | Readonly<{ type: "not-found" }>
   | Readonly<{ type: "unavailable" }>
 
@@ -257,10 +258,7 @@ export class AssistantMessageGenerationModule {
     }
 
     const cancellation = new AbortController()
-    const ids = [attempt.assistantMessageId, request.requestId].filter(
-      (id): id is string => id !== undefined,
-    )
-    for (const id of ids) this.activeGenerations.set(id, cancellation)
+    this.activeGenerations.set(attempt.assistantMessageId, cancellation)
 
     return {
       type: "started",
@@ -270,28 +268,27 @@ export class AssistantMessageGenerationModule {
         disconnected: request.disconnected ?? new AbortController().signal,
         userMessageId: attempt.userMessageId,
         assistantMessageId: attempt.assistantMessageId,
-        activeIds: ids,
       }),
     }
   }
 
-  async cancel(
-    target: Readonly<{ kind: "assistant" | "request"; id: string }>,
-  ): Promise<CancelGenerationResult> {
-    const cancellation = this.activeGenerations.get(target.id)
-    let persistedCancellation = false
-    if (target.kind === "assistant") {
-      try {
-        persistedCancellation = await cancelAssistantMessage(target.id)
-      } catch {
-        return { type: "unavailable" }
+  async cancel(assistantMessageId: string): Promise<CancelGenerationResult> {
+    try {
+      const result = await cancelAssistantMessage(assistantMessageId)
+      this.activeGenerations.get(assistantMessageId)?.abort()
+      if (
+        result.outcome === "cancelled" ||
+        result.outcome === "already-cancelled"
+      ) {
+        return { type: "accepted", status: "cancelled" }
       }
-    }
-    if (!persistedCancellation && cancellation === undefined) {
+      if (result.outcome === "terminal-conflict") {
+        return { type: "terminal-conflict", status: result.status }
+      }
       return { type: "not-found" }
+    } catch {
+      return { type: "unavailable" }
     }
-    cancellation?.abort()
-    return { type: "accepted" }
   }
 
   private async *generate({
@@ -300,14 +297,12 @@ export class AssistantMessageGenerationModule {
     disconnected,
     userMessageId,
     assistantMessageId,
-    activeIds,
   }: Readonly<{
     messages: readonly ChatMessage[]
     cancellation: AbortController
     disconnected: AbortSignal
     userMessageId: string
     assistantMessageId: string
-    activeIds: readonly string[]
   }>): AsyncGenerator<AssistantMessageGenerationEvent> {
     const startedAt = performance.now()
     const totalTimeout = new AbortController()
@@ -339,6 +334,10 @@ export class AssistantMessageGenerationModule {
           ),
       })
     } catch (error) {
+      if (await this.emitIfCancelled(assistantMessageId)) {
+        yield { type: "message.cancelled" }
+        return
+      }
       const failure =
         error instanceof ChatProviderError
           ? providerErrors[error.kind]
@@ -349,15 +348,26 @@ export class AssistantMessageGenerationModule {
         persistedContent,
         failure.code,
       ).catch(() => null)
-      if (failurePersisted !== false) {
+      if (failurePersisted === true) {
         yield { type: "message.failed", error: failure }
-      } else {
-        yield { type: "message.cancelled" }
+      } else if (failurePersisted === false) {
+        // Another writer already committed a terminal status.
+        if (
+          (await readAssistantMessageStatus(assistantMessageId)) === "cancelled"
+        ) {
+          yield { type: "message.cancelled" }
+        }
       }
     } finally {
       clearTimeout(totalTimer)
-      for (const id of activeIds) this.activeGenerations.delete(id)
+      this.activeGenerations.delete(assistantMessageId)
     }
+  }
+
+  private async emitIfCancelled(assistantMessageId: string): Promise<boolean> {
+    return (
+      (await readAssistantMessageStatus(assistantMessageId)) === "cancelled"
+    )
   }
 
   private async *pipeProviderStream({
@@ -418,6 +428,9 @@ export class AssistantMessageGenerationModule {
             yield { type: "message.cancelled" }
             return
           }
+          if (result === assistantTerminalTaken) {
+            return
+          }
           if (result.done) break
           firstActivity = false
 
@@ -427,7 +440,9 @@ export class AssistantMessageGenerationModule {
             contentStarted = true
             completeContent += result.value.delta
             if (!(await onContent(completeContent))) {
-              yield { type: "message.cancelled" }
+              if (await this.emitIfCancelled(assistantMessageId)) {
+                yield { type: "message.cancelled" }
+              }
               return
             }
             yield { type: "content.delta", delta: result.value.delta }
@@ -441,7 +456,9 @@ export class AssistantMessageGenerationModule {
         }
         yield { type: "usage.snapshot", usage }
         if (!(await onTerminal("completed", null))) {
-          yield { type: "message.cancelled" }
+          if (await this.emitIfCancelled(assistantMessageId)) {
+            yield { type: "message.cancelled" }
+          }
           return
         }
         yield {
@@ -451,7 +468,13 @@ export class AssistantMessageGenerationModule {
         return
       } catch (error) {
         if (cancellation.aborted || disconnected.aborted) {
-          await onTerminal("cancelled", null)
+          const cancelled = await onTerminal("cancelled", null)
+          if (cancelled || (await this.emitIfCancelled(assistantMessageId))) {
+            yield { type: "message.cancelled" }
+          }
+          return
+        }
+        if (await this.emitIfCancelled(assistantMessageId)) {
           yield { type: "message.cancelled" }
           return
         }
@@ -479,9 +502,14 @@ async function nextWithTimeout<T>(
   timeoutMs: number,
   timeoutController: AbortController,
   assistantMessageId: string,
-): Promise<IteratorResult<T> | typeof assistantCancelled> {
+): Promise<
+  IteratorResult<T> | typeof assistantCancelled | typeof assistantTerminalTaken
+> {
   const deadline = performance.now() + timeoutMs
-  const next = iterator.next()
+  const next = iterator.next().then(
+    (result) => ({ ok: true as const, result }),
+    (error: unknown) => ({ ok: false as const, error }),
+  )
 
   while (true) {
     const remainingMs = deadline - performance.now()
@@ -494,18 +522,35 @@ async function nextWithTimeout<T>(
     const poll = new Promise<null>((resolve) => {
       timer = setTimeout(resolve, Math.min(500, remainingMs), null)
     })
-    const result = await Promise.race([next, poll])
+    const raced = await Promise.race([next, poll])
     clearTimeout(timer)
-    if (result !== null) return result
 
-    if (!(await isAssistantMessageStreaming(assistantMessageId))) {
-      timeoutController.abort()
-      return assistantCancelled
+    if (raced !== null) {
+      if (!raced.ok) {
+        const status = await readAssistantMessageStatus(assistantMessageId)
+        if (status === "cancelled") {
+          timeoutController.abort()
+          return assistantCancelled
+        }
+        if (status === "completed" || status === "failed") {
+          timeoutController.abort()
+          return assistantTerminalTaken
+        }
+        throw raced.error
+      }
+      return raced.result
     }
+
+    const status = await readAssistantMessageStatus(assistantMessageId)
+    if (status === "streaming") continue
+    timeoutController.abort()
+    if (status === "cancelled") return assistantCancelled
+    return assistantTerminalTaken
   }
 }
 
 const assistantCancelled = Symbol("assistant-cancelled")
+const assistantTerminalTaken = Symbol("assistant-terminal-taken")
 
 function normalizeProviderError(error: unknown): ChatProviderError {
   return error instanceof ChatProviderError

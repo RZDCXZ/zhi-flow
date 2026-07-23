@@ -978,22 +978,22 @@ describe("Zhi Flow Web 服务", () => {
       async (upstreamUrl) => {
         await withDevelopmentServer(
           async (baseUrl) => {
-            const requestId = "22222222-2222-4222-8222-222222222222"
             const response = await fetch(`${baseUrl}/api/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(
-                chatRequestBody({ requestId, message: "测试停止。" }),
-              ),
+              body: JSON.stringify(chatRequestBody({ message: "测试停止。" })),
             })
             if (response.body === null) throw new Error("聊天响应没有正文流")
 
             const reader = response.body.getReader()
             const firstPart = await readStreamUntil(reader, "停止前正文")
+            const assistantMessageId =
+              readSseEvents(firstPart)[0]?.data.assistantMessageId
+            expect(assistantMessageId).toEqual(expect.any(String))
             const stopResponse = await fetch(`${baseUrl}/api/chat`, {
               method: "DELETE",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ requestId }),
+              body: JSON.stringify({ assistantMessageId }),
             })
             const rest = await readRemainingStream(reader)
             const events = readSseEvents(firstPart + rest)

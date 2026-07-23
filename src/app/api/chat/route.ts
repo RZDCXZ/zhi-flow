@@ -39,26 +39,21 @@ export async function POST(request: Request) {
     )
   }
 
-  return new Response(
-    createResponseStream(result.events, requestId, () => {
-      void assistantMessageGeneration.cancel({ kind: "request", id: requestId })
-    }),
-    {
-      headers: {
-        "Cache-Control": "no-cache, no-store",
-        Connection: "keep-alive",
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "X-Accel-Buffering": "no",
-      },
+  return new Response(createResponseStream(result.events, requestId), {
+    headers: {
+      "Cache-Control": "no-cache, no-store",
+      Connection: "keep-alive",
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "X-Accel-Buffering": "no",
     },
-  )
+  })
 }
 
 export async function DELETE(request: Request) {
-  const target = await readCancellationTarget(request)
-  if (target === null) return chatError(invalidInputError)
+  const assistantMessageId = await readAssistantMessageId(request)
+  if (assistantMessageId === null) return chatError(invalidInputError)
 
-  const result = await assistantMessageGeneration.cancel(target)
+  const result = await assistantMessageGeneration.cancel(assistantMessageId)
   if (result.type === "unavailable") {
     return chatError({
       status: 503,
@@ -72,6 +67,17 @@ export async function DELETE(request: Request) {
       status: 404,
       code: "INVALID_INPUT",
       message: "本次生成已结束。",
+      retryable: false,
+    })
+  }
+  if (result.type === "terminal-conflict") {
+    return chatError({
+      status: 409,
+      code: "INVALID_INPUT",
+      message:
+        result.status === "completed"
+          ? "该 Assistant Message 已完成，无法取消。"
+          : "该 Assistant Message 已失败，无法取消。",
       retryable: false,
     })
   }
@@ -103,7 +109,6 @@ const startFailureStatus = {
 function createResponseStream(
   events: AsyncIterable<AssistantMessageGenerationEvent>,
   requestId: string,
-  onCancel: () => void,
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
   let consumerCancelled = false
@@ -121,7 +126,6 @@ function createResponseStream(
           controller.enqueue(chunk)
         } catch {
           consumerCancelled = true
-          onCancel()
         }
       }
 
@@ -150,7 +154,6 @@ function createResponseStream(
     },
     cancel() {
       consumerCancelled = true
-      onCancel()
     },
   })
 }
@@ -193,21 +196,20 @@ async function readRequestBody(request: Request): Promise<{
   }
 }
 
-async function readCancellationTarget(
+async function readAssistantMessageId(
   request: Request,
-): Promise<{ kind: "assistant" | "request"; id: string } | null> {
+): Promise<string | null> {
   try {
     const body: unknown = await request.json()
-    if (typeof body !== "object" || body === null) return null
     if (
-      "assistantMessageId" in body &&
-      isNonEmptyBoundedString(body.assistantMessageId)
+      typeof body !== "object" ||
+      body === null ||
+      !("assistantMessageId" in body) ||
+      !isNonEmptyBoundedString(body.assistantMessageId)
     ) {
-      return { kind: "assistant", id: body.assistantMessageId }
+      return null
     }
-    return "requestId" in body && isNonEmptyBoundedString(body.requestId)
-      ? { kind: "request", id: body.requestId }
-      : null
+    return body.assistantMessageId
   } catch {
     return null
   }

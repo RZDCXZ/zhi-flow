@@ -441,6 +441,223 @@ describe("Assistant Message 生成 module", () => {
     expect(firstEvents.at(-1)?.type).toBe("message.completed")
     expect(secondEvents.at(-1)?.type).toBe("message.completed")
   })
+
+  it("同实例按 Assistant Message ID 停止时立即取消 Provider 并持久化 cancelled", async () => {
+    const conversationId = await createConversation("同实例取消")
+    const provider = new FakeChatProvider(async function* (request) {
+      yield { type: "content.delta", delta: "停止前正文" }
+      await waitForAbort(request.signal)
+    })
+    const generation = createGeneration(provider)
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "请停止这次生成",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const stream = await takeUntilContentDelta(started.events)
+    const cancelResult = await generation.cancel(stream.assistantMessageId)
+    const events = await collectEvents(stream.rest)
+
+    expect(cancelResult).toEqual({ type: "accepted", status: "cancelled" })
+    expect(provider.requests[0]?.signal.aborted).toBe(true)
+    expect(events.at(-1)).toEqual({ type: "message.cancelled" })
+    await expectAssistantStatus(
+      stream.assistantMessageId,
+      "cancelled",
+      "停止前正文",
+    )
+  })
+
+  it("其他实例可通过数据库状态发现取消并产生 cancelled 终态", async () => {
+    const conversationId = await createConversation("跨实例取消")
+    const ownerProvider = new FakeChatProvider(async function* (request) {
+      yield { type: "content.delta", delta: "跨实例部分正文" }
+      await waitForAbort(request.signal)
+    })
+    const peerProvider = successfulProvider("不会被调用")
+    const owner = createGeneration(ownerProvider)
+    const peer = createGeneration(peerProvider)
+    const started = await owner.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "跨实例停止",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+
+    const stream = await takeUntilContentDelta(started.events)
+    const cancelResult = await peer.cancel(stream.assistantMessageId)
+    const events = await collectEvents(stream.rest)
+
+    expect(cancelResult).toEqual({ type: "accepted", status: "cancelled" })
+    expect(events.at(-1)).toEqual({ type: "message.cancelled" })
+    await expectAssistantStatus(
+      stream.assistantMessageId,
+      "cancelled",
+      "跨实例部分正文",
+    )
+    expect(peerProvider.requests).toHaveLength(0)
+  })
+
+  it("重复停止已取消的 Assistant Message 仍成功且不改写状态", async () => {
+    const conversationId = await createConversation("重复取消")
+    const provider = new FakeChatProvider(async function* (request) {
+      yield { type: "content.delta", delta: "可重复停止" }
+      await waitForAbort(request.signal)
+    })
+    const generation = createGeneration(provider)
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "重复停止",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+    const stream = await takeUntilContentDelta(started.events)
+
+    const firstCancel = await generation.cancel(stream.assistantMessageId)
+    const secondCancel = await generation.cancel(stream.assistantMessageId)
+    await collectEvents(stream.rest)
+
+    expect(firstCancel).toEqual({ type: "accepted", status: "cancelled" })
+    expect(secondCancel).toEqual({ type: "accepted", status: "cancelled" })
+    await expectAssistantStatus(
+      stream.assistantMessageId,
+      "cancelled",
+      "可重复停止",
+    )
+  })
+
+  it("停止已完成或已失败的 Assistant Message 返回终态冲突且不改写", async () => {
+    const conversationId = await createConversation("终态冲突取消")
+    const completedProvider = successfulProvider("已经完成")
+    const completedGeneration = createGeneration(completedProvider)
+    const completedStart = await completedGeneration.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "完成后停止",
+    })
+    expect(completedStart.type).toBe("started")
+    if (completedStart.type !== "started") return
+    const completedEvents = await collectEvents(completedStart.events)
+    const completedCreated = completedEvents[0]
+    expect(completedCreated?.type).toBe("message.created")
+    if (completedCreated?.type !== "message.created") return
+
+    const completedCancel = await completedGeneration.cancel(
+      completedCreated.assistantMessageId,
+    )
+    expect(completedCancel).toEqual({
+      type: "terminal-conflict",
+      status: "completed",
+    })
+    await expectAssistantStatus(
+      completedCreated.assistantMessageId,
+      "completed",
+      "已经完成",
+    )
+
+    const failedConversationId = await createConversation("失败后取消")
+    const failedProvider = new FakeChatProvider(async function* () {
+      throw new Error("provider boom")
+    })
+    const failedGeneration = createGeneration(failedProvider)
+    const failedStart = await failedGeneration.start({
+      conversationId: failedConversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "失败后停止",
+    })
+    expect(failedStart.type).toBe("started")
+    if (failedStart.type !== "started") return
+    const failedEvents = await collectEvents(failedStart.events)
+    const failedCreated = failedEvents[0]
+    expect(failedCreated?.type).toBe("message.created")
+    if (failedCreated?.type !== "message.created") return
+    expect(failedEvents.at(-1)?.type).toBe("message.failed")
+
+    const failedCancel = await failedGeneration.cancel(
+      failedCreated.assistantMessageId,
+    )
+    expect(failedCancel).toEqual({
+      type: "terminal-conflict",
+      status: "failed",
+    })
+    const { data: failedMessage, error } = await dataClient
+      .from("messages")
+      .select("status,content,error_code")
+      .eq("id", failedCreated.assistantMessageId)
+      .single()
+    if (error) throw error
+    expect(failedMessage).toEqual({
+      status: "failed",
+      content: "",
+      error_code: "PROVIDER_UNAVAILABLE",
+    })
+  })
+
+  it("停止未知或用户角色 Message 返回未找到", async () => {
+    const conversationId = await createConversation("取消目标校验")
+    const generation = createGeneration(successfulProvider("不会调用"))
+    const { data: userMessage, error } = await dataClient
+      .from("messages")
+      .insert({
+        conversation_id: conversationId,
+        role: "user",
+        content: "不是助手",
+        status: "completed",
+        client_idempotency_key: crypto.randomUUID(),
+      })
+      .select("id")
+      .single()
+    if (error) throw error
+
+    await expect(
+      generation.cancel("00000000-0000-4000-8000-000000000000"),
+    ).resolves.toEqual({ type: "not-found" })
+    await expect(generation.cancel(userMessage.id)).resolves.toEqual({
+      type: "not-found",
+    })
+  })
+
+  it("完成与取消竞争时只有数据库获胜方决定终态", async () => {
+    const conversationId = await createConversation("完成取消竞争")
+    let releaseCompletion!: () => void
+    const allowCompletion = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
+    const provider = new FakeChatProvider(async function* () {
+      yield { type: "content.delta", delta: "竞争正文" }
+      await allowCompletion
+      yield {
+        type: "usage.snapshot",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }
+    })
+    const generation = createGeneration(provider)
+    const started = await generation.start({
+      conversationId,
+      clientIdempotencyKey: crypto.randomUUID(),
+      message: "竞争",
+    })
+    expect(started.type).toBe("started")
+    if (started.type !== "started") return
+    const stream = await takeUntilContentDelta(started.events)
+
+    const cancelResult = await generation.cancel(stream.assistantMessageId)
+    releaseCompletion()
+    const events = await collectEvents(stream.rest)
+
+    expect(cancelResult).toEqual({ type: "accepted", status: "cancelled" })
+    expect(events.at(-1)).toEqual({ type: "message.cancelled" })
+    await expectAssistantStatus(
+      stream.assistantMessageId,
+      "cancelled",
+      "竞争正文",
+    )
+  })
 })
 
 function createGeneration(provider: FakeChatProvider) {
@@ -468,6 +685,87 @@ async function collectEvents(
   const collected: AssistantMessageGenerationEvent[] = []
   for await (const event of events) collected.push(event)
   return collected
+}
+
+async function takeUntilContentDelta(
+  events: AsyncIterable<AssistantMessageGenerationEvent>,
+): Promise<{
+  assistantMessageId: string
+  rest: AsyncIterable<AssistantMessageGenerationEvent>
+}> {
+  const iterator = events[Symbol.asyncIterator]()
+  let assistantMessageId: string | undefined
+  while (true) {
+    const next = await iterator.next()
+    if (next.done) throw new Error("流在正文前结束")
+    if (next.value.type === "message.created") {
+      assistantMessageId = next.value.assistantMessageId
+      continue
+    }
+    if (next.value.type === "content.delta") {
+      if (assistantMessageId === undefined) {
+        throw new Error("未收到 message.created")
+      }
+      return {
+        assistantMessageId,
+        rest: prependEvent(next.value, iterator),
+      }
+    }
+  }
+}
+
+function prependEvent(
+  event: AssistantMessageGenerationEvent,
+  iterator: AsyncIterator<AssistantMessageGenerationEvent>,
+): AsyncIterable<AssistantMessageGenerationEvent> {
+  let first = true
+  return {
+    [Symbol.asyncIterator]: () => ({
+      next: async () => {
+        if (first) {
+          first = false
+          return { done: false as const, value: event }
+        }
+        return iterator.next()
+      },
+      return: async (value?: unknown) =>
+        iterator.return?.(value) ?? { done: true as const, value },
+    }),
+  }
+}
+
+async function waitForAbort(signal: AbortSignal): Promise<never> {
+  if (signal.aborted) {
+    throw new DOMException("Chat stream was cancelled", "AbortError")
+  }
+  await new Promise<void>((_, reject) => {
+    signal.addEventListener(
+      "abort",
+      () => {
+        reject(new DOMException("Chat stream was cancelled", "AbortError"))
+      },
+      { once: true },
+    )
+  })
+  throw new DOMException("Chat stream was cancelled", "AbortError")
+}
+
+async function expectAssistantStatus(
+  assistantMessageId: string,
+  status: "streaming" | "completed" | "cancelled" | "failed",
+  content: string,
+): Promise<void> {
+  const { data, error } = await dataClient
+    .from("messages")
+    .select("status,content,error_code")
+    .eq("id", assistantMessageId)
+    .single()
+  if (error) throw error
+  expect(data).toEqual({
+    status,
+    content,
+    error_code: null,
+  })
 }
 
 async function createConversation(title: string): Promise<string> {

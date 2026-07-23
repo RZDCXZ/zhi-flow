@@ -266,10 +266,20 @@ export async function finishAssistantMessage(
   return data !== null
 }
 
+export type CancelAssistantMessageResult =
+  | Readonly<{ outcome: "cancelled" }>
+  | Readonly<{ outcome: "already-cancelled" }>
+  | Readonly<{
+      outcome: "terminal-conflict"
+      status: Exclude<Message["status"], "streaming" | "cancelled">
+    }>
+  | Readonly<{ outcome: "not-found" }>
+
 export async function cancelAssistantMessage(
   assistantMessageId: string,
-): Promise<boolean> {
-  const { data, error } = await createServerDataClient()
+): Promise<CancelAssistantMessageResult> {
+  const client = createServerDataClient()
+  const { data, error } = await client
     .from("messages")
     .update({
       status: "cancelled",
@@ -282,21 +292,42 @@ export async function cancelAssistantMessage(
     .select("id")
     .maybeSingle()
   if (error) throw error
-  return data !== null
+  if (data !== null) return { outcome: "cancelled" }
+
+  const { data: existing, error: readError } = await client
+    .from("messages")
+    .select("status")
+    .eq("id", assistantMessageId)
+    .eq("role", "assistant")
+    .maybeSingle()
+  if (readError) throw readError
+  if (existing === null) return { outcome: "not-found" }
+
+  const status = existing.status as Message["status"]
+  if (status === "cancelled") return { outcome: "already-cancelled" }
+  if (status === "completed" || status === "failed") {
+    return { outcome: "terminal-conflict", status }
+  }
+  return { outcome: "not-found" }
+}
+
+export async function readAssistantMessageStatus(
+  assistantMessageId: string,
+): Promise<Message["status"] | null> {
+  const { data, error } = await createServerDataClient()
+    .from("messages")
+    .select("status")
+    .eq("id", assistantMessageId)
+    .eq("role", "assistant")
+    .maybeSingle()
+  if (error) throw error
+  return data === null ? null : (data.status as Message["status"])
 }
 
 export async function isAssistantMessageStreaming(
   assistantMessageId: string,
 ): Promise<boolean> {
-  const { data, error } = await createServerDataClient()
-    .from("messages")
-    .select("id")
-    .eq("id", assistantMessageId)
-    .eq("role", "assistant")
-    .eq("status", "streaming")
-    .maybeSingle()
-  if (error) throw error
-  return data !== null
+  return (await readAssistantMessageStatus(assistantMessageId)) === "streaming"
 }
 
 function toConversation(row: ConversationRow): Conversation {
